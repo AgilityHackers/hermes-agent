@@ -158,6 +158,53 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _pending_connectors_hint() -> str:
+    """Name the connectors the user opted into but hasn't connected yet.
+
+    ``mcp.connectors`` is an intent list written by the desktop onboarding
+    step: "these are the apps I use." It is deliberately NOT the same thing
+    as ``mcp_servers`` — nothing was configured and no credential was
+    collected, because the whole point is to defer sign-in to the moment a
+    task actually needs the app. Telling the agent about the gap is what
+    closes the loop: it knows to raise a setup card instead of apologizing
+    that it can't reach Linear.
+
+    Read once, here, with the rest of the stable prefix. The list is intent
+    rather than live state, so it can't shift mid-conversation and break the
+    prompt cache — and a connector that IS configured drops off the list on
+    the next session, which is exactly when the prompt is rebuilt anyway.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        wanted = (config.get("mcp") or {}).get("connectors")
+        if not isinstance(wanted, list):
+            return ""
+
+        configured = config.get("mcp_servers")
+        configured_names = set(configured) if isinstance(configured, dict) else set()
+
+        pending = [
+            name
+            for name in dict.fromkeys(str(item).strip() for item in wanted)
+            if name and name not in configured_names
+        ]
+    except Exception:
+        return ""
+
+    if not pending:
+        return ""
+
+    return (
+        "The user has told us they use these apps, but they are not connected "
+        f"yet: {', '.join(pending)}. When a task needs one of them, call "
+        "setup_mcp with that connector name instead of saying you lack access "
+        "— the card handles sign-in inline. Do not set them up preemptively, "
+        "and drop one for the rest of the session if they decline it."
+    )
+
+
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
@@ -767,6 +814,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
+
+    # Desktop is the only surface with setup_mcp, so it's the only one where
+    # naming un-connected connectors leads anywhere actionable.
+    if platform_key == "desktop":
+        _connectors_hint = _pending_connectors_hint()
+        if _connectors_hint:
+            post_workspace_parts.append(_connectors_hint)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []

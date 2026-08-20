@@ -487,6 +487,30 @@ async def list_mcp_catalog(profile: Optional[str] = None):
     return {"entries": entries, "diagnostics": diagnostics}
 
 
+@router.get("/api/mcp/registry/search")
+async def search_mcp_registry(q: str = "", limit: int = 12):
+    """Search the official MCP Registry for hosted connectors.
+
+    The tier below the reviewed catalog: results are remote endpoints only
+    (never a package launcher — see hermes_cli.mcp_registry for why that
+    filter lives in the backend), each labeled ``verified`` when the
+    publisher's registry namespace owns the domain serving the endpoint, or
+    ``community`` when nothing ties the two together.
+
+    Never raises for a registry failure. Discovery degrading to the reviewed
+    catalog is correct behavior; a 500 here would break the consent card and
+    the composer for a purely optional lookup.
+    """
+    try:
+        from hermes_cli import mcp_registry
+    except Exception as exc:
+        _log.exception("mcp_registry import failed")
+        raise HTTPException(status_code=500, detail=f"Registry unavailable: {exc}")
+
+    entries = await asyncio.to_thread(mcp_registry.search, q, max(1, min(50, limit)))
+    return {"entries": [entry.as_dict() for entry in entries]}
+
+
 @router.post("/api/mcp/catalog/install")
 async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[str] = None):
     """Install a catalog MCP into config.yaml.

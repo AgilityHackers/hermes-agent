@@ -6378,15 +6378,23 @@ def _agent_cbs(sid: str) -> dict:
             timeout=30,
         ),
         # setup_mcp tool (desktop GUI): the renderer shows an inline consent
-        # card and walks the user through install/enable/OAuth via the REST
-        # endpoints, then answers mcp.setup.respond with the JSON outcome.
-        # Long timeout on purpose — the flow can include typing an API key or
-        # a browser OAuth round-trip. Same lifecycle as clarify: on timeout
-        # the tool returns "unanswered" and a late answer is tolerated.
-        "setup_mcp_callback": lambda server, action, reason: _block(
+        # card with a switch per connector and walks the user through
+        # add/enable/key/OAuth via the REST endpoints, then answers
+        # mcp.setup.respond with the JSON outcome. Long timeout on purpose —
+        # the flow can include typing an API key or a browser OAuth
+        # round-trip, once per connector. Same lifecycle as clarify: on
+        # timeout the tool returns "unanswered" and a late answer is
+        # tolerated. `server` is still sent alongside `servers` so an older
+        # renderer that only reads the scalar keeps working.
+        "setup_mcp_callback": lambda servers, action, reason: _block(
             "mcp.setup.request",
             sid,
-            {"server": server, "action": action, "reason": reason},
+            {
+                "server": servers[0] if servers else "",
+                "servers": list(servers),
+                "action": action,
+                "reason": reason,
+            },
             timeout=600,
         ),
         # tour tool (desktop GUI): the renderer drives driver.js — highlighting
