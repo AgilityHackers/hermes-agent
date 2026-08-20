@@ -2247,6 +2247,15 @@ export interface Translations {
     price: (input: string, output: string) => string
     change: string
     startChatting: string
+    connectors: {
+      title: string
+      subtitle: string
+      searchPlaceholder: string
+      noResults: (query: string) => string
+      noneAvailable: string
+      continueWith: (count: number) => string
+      skip: string
+    }
     docs: (provider: string) => string
   }
 

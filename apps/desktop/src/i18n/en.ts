@@ -2670,6 +2670,16 @@ export const en: Translations = {
     price: (input, output) => `${input} in / ${output} out per Mtok`,
     change: 'Change',
     startChatting: 'Begin',
+    connectors: {
+      title: 'Which apps do you use?',
+      subtitle:
+        'Hermes will offer to connect these the first time it needs one. Nothing is connected now, and you can change this any time.',
+      searchPlaceholder: 'Search apps…',
+      noResults: query => `Nothing found for “${query}”`,
+      noneAvailable: 'No apps available yet',
+      continueWith: count => (count === 1 ? 'Begin with 1 app' : `Begin with ${count} apps`),
+      skip: 'Skip for now'
+    },
     docs: provider => `${provider} docs`
   },
 

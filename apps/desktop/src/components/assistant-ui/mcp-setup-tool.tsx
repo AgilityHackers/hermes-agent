@@ -17,8 +17,8 @@ import { triggerHaptic } from '@/lib/haptics'
 import { AlertCircle, CheckCircle2, Loader2 } from '@/lib/icons'
 import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
 import {
-  type Connector,
   connectConnector,
+  type Connector,
   ConnectorCancelled,
   type ConnectorState,
   invalidateConnectorCache,
@@ -75,14 +75,15 @@ const CANCELLED = Symbol('mcp-setup-cancelled')
 function readSetupArgs(args: unknown): SetupArgs {
   const row = parseMaybeObject(args)
   const rawAction = typeof row.action === 'string' ? row.action : 'connect'
+
   const listed = Array.isArray(row.servers)
     ? row.servers.filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
     : []
+
   const single = typeof row.server === 'string' && row.server.trim() ? [row.server] : []
 
   return {
-    action:
-      rawAction === 'enable' || rawAction === 'authorize' || rawAction === 'install' ? rawAction : 'connect',
+    action: rawAction === 'enable' || rawAction === 'authorize' || rawAction === 'install' ? rawAction : 'connect',
     reason: typeof row.reason === 'string' ? row.reason : '',
     servers: [...new Set([...single, ...listed])]
   }
@@ -192,12 +193,7 @@ function McpSetupSettled({ args, result }: ToolCallMessagePartProps) {
               )
             }
           >
-            <span
-              className={cn(
-                'font-medium',
-                connector.status === 'skipped' && 'italic text-(--ui-text-tertiary)'
-              )}
-            >
+            <span className={cn('font-medium', connector.status === 'skipped' && 'italic text-(--ui-text-tertiary)')}>
               {ok
                 ? copy.connected(name)
                 : connector.status === 'skipped'
@@ -236,7 +232,11 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const gateway = useStore($gateway)
   const fromArgs = useMemo(() => readSetupArgs(args), [args])
 
-  const names = fromArgs.servers.length > 0 ? fromArgs.servers : (request?.servers ?? [])
+  const names = useMemo(
+    () => (fromArgs.servers.length > 0 ? fromArgs.servers : (request?.servers ?? [])),
+    [fromArgs.servers, request?.servers]
+  )
+
   const action: SetupAction = fromArgs.action ?? request?.action ?? 'connect'
   const reason = fromArgs.reason || request?.reason || ''
   // Names are the identity of this card's offer; join so the resolve effect
@@ -266,6 +266,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
     void (async () => {
       const resolved = await resolveConnectors(names).catch((): Connector[] => [])
+
       const states = await loadConnectorStates(resolved.map(entry => entry.name)).catch(
         (): Record<string, ConnectorState> => ({})
       )
@@ -398,6 +399,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       for (const row of chosen) {
         if (cancelRef.current) {
           outcomes.push({ server: row.connector.name, status: 'skipped' })
+
           continue
         }
 
@@ -418,6 +420,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
             // One cancelled sign-in shouldn't silently abandon the rest, but
             // it usually means "stop" — honor that and skip the remainder.
             cancelRef.current = true
+
             continue
           }
 
@@ -509,9 +512,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   }, [approve, decline, ready, working])
 
   const title = copy.connectTitle(
-    rows && rows.length > 0
-      ? rows.map(row => row.connector.title).join(', ')
-      : names.map(prettyName).join(', ')
+    rows && rows.length > 0 ? rows.map(row => row.connector.title).join(', ') : names.map(prettyName).join(', ')
   )
 
   if (!ready) {
@@ -548,6 +549,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   }
 
   const multi = rows.length > 1
+
   const envFields = chosen.flatMap(row =>
     row.state === 'not_configured' ? row.connector.requiredEnv.map(env => ({ ...env, owner: row.connector })) : []
   )
@@ -656,14 +658,10 @@ function ConnectorRow({
   // approving, especially for an unreviewed publisher.
   const endpoint = connector.url ?? copy.catalogSource
 
-  const stateLabel =
-    state === 'disabled' ? copy.stateDisabled : state === 'needs_auth' ? copy.stateNeedsAuth : null
+  const stateLabel = state === 'disabled' ? copy.stateDisabled : state === 'needs_auth' ? copy.stateNeedsAuth : null
 
   return (
-    <div
-      className={cn('flex items-start gap-2 rounded-md py-0.5', !checked && 'opacity-45')}
-      data-slot="mcp-setup-row"
-    >
+    <div className={cn('flex items-start gap-2 rounded-md py-0.5', !checked && 'opacity-45')} data-slot="mcp-setup-row">
       {phase === 'working' ? (
         <Loader2 aria-hidden className="mt-0.5 size-4 shrink-0 animate-spin text-(--ui-text-tertiary)" />
       ) : phase === 'done' ? (
@@ -680,9 +678,7 @@ function ConnectorRow({
           <TrustBadge connector={connector} copy={copy} />
           {stateLabel && <span className="text-[0.6875rem] text-(--ui-text-tertiary)">{stateLabel}</span>}
         </div>
-        {connector.description ? (
-          <p className="truncate text-(--ui-text-secondary)">{connector.description}</p>
-        ) : null}
+        {connector.description ? <p className="truncate text-(--ui-text-secondary)">{connector.description}</p> : null}
         <p className="truncate text-[0.6875rem] text-(--ui-text-tertiary)">{endpoint}</p>
       </div>
 

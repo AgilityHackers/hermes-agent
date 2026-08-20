@@ -13,8 +13,8 @@ import {
   setMcpServerEnabled,
   testMcpServer
 } from '@/hermes'
-import { MCP_DIRECTORY } from '@/lib/mcp-directory'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+import { MCP_DIRECTORY } from '@/lib/mcp-directory'
 import { prettyName } from '@/lib/text'
 
 /**
@@ -145,6 +145,7 @@ function fromRegistry(entry: McpRegistryEntry): Connector {
  */
 export async function resolveConnectors(names: string[]): Promise<Connector[]> {
   const wanted = [...new Set(names.map(name => name.trim().toLowerCase()).filter(Boolean))]
+
   if (wanted.length === 0) {
     return []
   }
@@ -152,6 +153,7 @@ export async function resolveConnectors(names: string[]): Promise<Connector[]> {
   const resolved = new Map<string, Connector>()
 
   const catalog = await loadCatalog().catch((): McpCatalogEntry[] => [])
+
   for (const entry of catalog) {
     if (wanted.includes(entry.name.toLowerCase()) && !resolved.has(entry.name.toLowerCase())) {
       resolved.set(entry.name.toLowerCase(), fromCatalog(entry))
@@ -200,10 +202,42 @@ export async function resolveConnectors(names: string[]): Promise<Connector[]> {
   return wanted.map(name => resolved.get(name)).filter((entry): entry is Connector => Boolean(entry))
 }
 
+/** Every connector we can offer without a network round-trip: the reviewed
+ *  catalog plus the curated vendor directory. This is the onboarding grid's
+ *  default content — a first-run user should see recognizable apps, not an
+ *  empty box waiting on a registry query they don't know to type into. */
+export async function listLocalConnectors(): Promise<Connector[]> {
+  const catalog = await loadCatalog().catch((): McpCatalogEntry[] => [])
+  const connectors = catalog.map(fromCatalog)
+  const taken = new Set(connectors.map(entry => entry.name.toLowerCase()))
+
+  for (const entry of MCP_DIRECTORY) {
+    if (!taken.has(entry.name.toLowerCase())) {
+      connectors.push({
+        auth: 'oauth',
+        description: entry.description,
+        docs: entry.docs,
+        name: entry.name,
+        needsInstall: false,
+        publisher: '',
+        registryName: '',
+        requiredEnv: [],
+        source: 'directory',
+        title: prettyName(entry.name),
+        trust: 'verified',
+        url: entry.url
+      })
+    }
+  }
+
+  return connectors.sort((a, b) => a.title.localeCompare(b.title))
+}
+
 /** Free-text connector search across catalog + registry, catalog first.
  *  Powers the onboarding grid's search box and off-catalog card resolution. */
 export async function searchConnectors(query: string, limit = 12): Promise<Connector[]> {
   const needle = query.trim().toLowerCase()
+
   if (needle.length < 2) {
     return []
   }
@@ -218,9 +252,7 @@ export async function searchConnectors(query: string, limit = 12): Promise<Conne
   ])
 
   const results: Connector[] = catalog
-    .filter(
-      entry => entry.name.toLowerCase().includes(needle) || entry.description.toLowerCase().includes(needle)
-    )
+    .filter(entry => entry.name.toLowerCase().includes(needle) || entry.description.toLowerCase().includes(needle))
     .map(fromCatalog)
 
   const taken = new Set(results.map(entry => entry.name.toLowerCase()))
@@ -417,8 +449,15 @@ export async function connectConnector(
     return { tools: (flow.tools ?? []).map(tool => tool.name) }
   } catch (error) {
     // Decline means "no connector", not an unauthorized entry left behind.
-    // Best-effort: the original error is the one worth reporting.
-    await removeMcpServer(connector.name).catch(() => {})
+    // The rollback is best-effort and must never replace the original error:
+    // a try/catch rather than `.catch()` so even a synchronous throw here
+    // still surfaces the reason the connect actually failed.
+    try {
+      await removeMcpServer(connector.name)
+    } catch {
+      // Config still holds the entry; the real failure is the one below.
+    }
+
     throw error
   }
 }

@@ -2840,6 +2840,15 @@ export const zh: Translations = {
     price: (input, output) => `${input} 输入 / ${output} 输出每 Mtok`,
     change: '更改',
     startChatting: '开始',
+    connectors: {
+      title: '你使用哪些应用？',
+      subtitle: 'Hermes 会在首次需要时提示连接。现在不会连接任何应用，你可以随时更改。',
+      searchPlaceholder: '搜索应用…',
+      noResults: query => `未找到“${query}”`,
+      noneAvailable: '暂无可用应用',
+      continueWith: count => `使用 ${count} 个应用开始`,
+      skip: '暂时跳过'
+    },
     docs: provider => `${provider} 文档`
   },
 

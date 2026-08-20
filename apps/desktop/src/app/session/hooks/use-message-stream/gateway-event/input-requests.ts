@@ -154,15 +154,19 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     // tool.start event was missed (stream reconnect / hydration race).
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
     const server = typeof payload?.server === 'string' ? payload.server : ''
+
     // `servers` is the current contract; `server` alone is what an older
     // backend sends, and it still has to raise a working single-row card.
     const listed = Array.isArray(payload?.servers)
       ? payload.servers.filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
       : []
+
     const servers = listed.length > 0 ? listed : server ? [server] : []
     const rawAction = typeof payload?.action === 'string' ? payload.action : 'connect'
+
     const action =
       rawAction === 'enable' || rawAction === 'authorize' || rawAction === 'install' ? rawAction : 'connect'
+
     const reason = typeof payload?.reason === 'string' ? payload.reason : ''
 
     if (requestId && servers.length > 0) {
