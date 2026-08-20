@@ -377,9 +377,9 @@ class ProcessSession:
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
     exited: bool = False                        # Whether the process has finished
-    exit_code: Optional[int] = None             # Exit code (None if still running)
+    exit_code: Optional[int] = None             # None only while running or when reason=lost
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    termination_source: str = ""                # process.kill|backend_lost|*_unavailable|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
@@ -792,6 +792,8 @@ class ProcessRegistry:
             # Recovered sessions no longer have a waitable handle, so the real
             # exit code is unavailable once the original process object is gone.
             session.exit_code = None
+            session.completion_reason = "lost"
+            session.termination_source = "detached_pid_unavailable"
 
         self._move_to_finished(session)
         return session
@@ -1432,15 +1434,30 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # Always reap the child to prevent zombie processes. This reader
+            # already runs in a daemon thread, so lifecycle truth is more
+            # important than a bounded wait here: stdout can close or fail
+            # while the child is still running. A timed-out wait followed by
+            # unconditional completion used to publish ``exited`` with
+            # ``returncode=None`` for a live process.
+            wait_failed = False
             try:
-                session.process.wait(timeout=5)
+                session.process.wait()
             except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+                logger.debug("Process wait failed: %s", e)
+                try:
+                    wait_failed = session.process.poll() is None
+                except Exception:
+                    wait_failed = True
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
+                if wait_failed:
+                    session.exit_code = None
+                    session.completion_reason = "lost"
+                    session.termination_source = "reader_wait_failed"
+                else:
+                    session.exit_code = session.process.returncode
+                    session.completion_reason = "exited"
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -1548,8 +1565,13 @@ class ProcessRegistry:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
         if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
+            exit_code = pty.exitstatus if hasattr(pty, "exitstatus") else None
+            session.exit_code = exit_code
+            if exit_code is None:
+                session.completion_reason = "lost"
+                session.termination_source = "pty_exit_status_unavailable"
+            else:
+                session.completion_reason = "exited"
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -2139,6 +2161,8 @@ class ProcessRegistry:
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
+                        session.completion_reason = "lost"
+                        session.termination_source = "detached_pid_unavailable"
                         output = strip_ansi(session.output_buffer[-2000:])
                     if consume_output:
                         self._completion_consumed.add(session_id)
@@ -2146,6 +2170,8 @@ class ProcessRegistry:
                     return {
                         "status": "already_exited",
                         "exit_code": session.exit_code,
+                        "completion_reason": session.completion_reason,
+                        "termination_source": session.termination_source,
                         "output": output,
                     }
                 self._terminate_host_pid(session.pid, session.host_start_time)
@@ -2362,6 +2388,9 @@ class ProcessRegistry:
                 entry["notify_on_complete"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
+                entry["completion_reason"] = s.completion_reason
+                if s.termination_source:
+                    entry["termination_source"] = s.termination_source
             if s.detached:
                 entry["detached"] = True
             result.append(entry)
@@ -2965,16 +2994,16 @@ def format_process_notification(evt: dict) -> "str | None":
     if _reason == "killed":
         _status = f"terminated by {_source or 'Hermes'}"
     elif _reason == "lost":
-        _status = "marked lost because the process backend disappeared"
+        _status = f"marked lost ({_source or 'exit result unavailable'})"
     elif _reason == "failed_start":
         _status = "failed to start"
     elif _exit == 0:
         _status = "completed normally"
     else:
         _status = "exited"
+    _exit_suffix = "" if _reason == "lost" and _exit is None else f" (exit code {_exit}{_signal})"
     text = (
-        f"[IMPORTANT: Background process {_sid} {_status} "
-        f"(exit code {_exit}{_signal}).\n"
+        f"[IMPORTANT: Background process {_sid} {_status}{_exit_suffix}.\n"
     )
     if _attribution:
         text += f"{_attribution}\n"

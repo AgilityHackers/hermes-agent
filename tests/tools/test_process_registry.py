@@ -313,6 +313,99 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
     assert moved == ["proc_reader_live"]
 
 
+def test_reader_failure_waits_for_real_child_exit_before_completion(registry, monkeypatch):
+    """A broken stdout reader must not publish an exited/null completion.
+
+    The child can close or lose its stdout pipe while continuing to run. A
+    bounded lifecycle wait used to time out after five seconds and the reader
+    then unconditionally marked the session exited with ``returncode=None``.
+    Completion must instead wait for the real child terminal state.
+    """
+
+    class _BrokenBuffer:
+        def read1(self, _n):
+            raise OSError("simulated reader failure")
+
+    class _BrokenStdout:
+        def __init__(self):
+            self.buffer = _BrokenBuffer()
+
+    class _StillRunningProcess:
+        def __init__(self):
+            self.stdout = _BrokenStdout()
+            self.returncode = None
+            self.wait_calls = []
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("watcher", timeout)
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    session = _make_session(sid="proc_reader_failure")
+    process = _StillRunningProcess()
+    session.process = process
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+
+    registry._reader_loop(session)
+
+    assert process.wait_calls == [None]
+    assert session.exited is True
+    assert session.exit_code == 0
+    assert session.completion_reason == "exited"
+    assert session.id in registry._finished
+    assert session.id not in registry._running
+    completion = registry.completion_queue.get_nowait()
+    assert completion["type"] == "completion"
+    assert completion["session_id"] == session.id
+    assert completion["exit_code"] == 0
+
+
+def test_reader_unreapable_child_is_explicitly_lost(registry):
+    """A failed wait/poll is classified, never serialized as plain exited/null."""
+
+    class _BrokenBuffer:
+        def read1(self, _n):
+            raise OSError("simulated reader failure")
+
+    class _BrokenStdout:
+        def __init__(self):
+            self.buffer = _BrokenBuffer()
+
+    class _UnreapableProcess:
+        def __init__(self):
+            self.stdout = _BrokenStdout()
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise OSError("simulated wait failure")
+
+        def poll(self):
+            return None
+
+    session = _make_session(sid="proc_reader_unreapable")
+    session.process = _UnreapableProcess()
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+
+    registry._reader_loop(session)
+
+    assert session.exited is True
+    assert session.exit_code is None
+    assert session.completion_reason == "lost"
+    assert session.termination_source == "reader_wait_failed"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["type"] == "completion"
+    assert completion["exit_code"] is None
+    assert completion["completion_reason"] == "lost"
+    assert completion["termination_source"] == "reader_wait_failed"
+
+
 # =========================================================================
 # Incremental UTF-8 decoding across chunk boundaries
 # (ported from openclaw/openclaw#112325)
@@ -412,6 +505,36 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer
+
+
+def test_pty_reader_unknown_exit_status_is_explicitly_lost(registry, monkeypatch):
+    """A PTY without an exit status must not be reported as plain exited."""
+
+    class _FakePty:
+        exitstatus = None
+
+        def isalive(self):
+            return False
+
+        def wait(self):
+            return None
+
+    session = _make_session(sid="proc_pty_lost")
+    session._pty = _FakePty()
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+
+    registry._pty_reader_loop(session)
+
+    assert session.exited is True
+    assert session.exit_code is None
+    assert session.completion_reason == "lost"
+    assert session.termination_source == "pty_exit_status_unavailable"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["exit_code"] is None
+    assert completion["completion_reason"] == "lost"
 
 
 # =========================================================================
@@ -1117,6 +1240,21 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+def test_format_lost_completion_omits_fake_null_exit_code():
+    text = format_process_notification({
+        "type": "completion",
+        "session_id": "proc_lost",
+        "command": "gh pr checks --watch",
+        "exit_code": None,
+        "completion_reason": "lost",
+        "termination_source": "detached_pid_unavailable",
+        "output": "",
+    })
+
+    assert "marked lost (detached_pid_unavailable)" in text
+    assert "exit code None" not in text
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",
@@ -1381,7 +1519,13 @@ class TestPidReuseGuard:
         registry._running[s.id] = s
         refreshed = registry._refresh_detached_session(s)
         assert refreshed.exited is True
+        assert refreshed.exit_code is None
+        assert refreshed.completion_reason == "lost"
+        assert refreshed.termination_source == "detached_pid_unavailable"
         assert s.id in registry._finished
+        entry = next(item for item in registry.list_sessions() if item["session_id"] == s.id)
+        assert entry["completion_reason"] == "lost"
+        assert entry["termination_source"] == "detached_pid_unavailable"
 
 
 @pytest.mark.skipif(sys.platform == "win32",
@@ -2169,6 +2313,11 @@ class TestSystemdCgroupIsolation:
         assert stopped == ["hermes-worker-proc_recovered_scope.scope"]
         assert terminated == []
         assert session.exited is True
+        assert session.exit_code is None
+        assert session.completion_reason == "lost"
+        assert session.termination_source == "detached_pid_unavailable"
+        assert result["completion_reason"] == "lost"
+        assert result["termination_source"] == "detached_pid_unavailable"
         assert session.id in registry._finished
         assert session.id not in registry._running
 
