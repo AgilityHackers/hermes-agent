@@ -1901,8 +1901,11 @@ class ProcessRegistry:
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = rc
+            session.exit_code = rc
+            if session._kill_requested_source:
+                session.completion_reason = "killed"
+                session.termination_source = session._kill_requested_source
+            elif session.completion_reason != "killed":
                 session.completion_reason = "exited"
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "

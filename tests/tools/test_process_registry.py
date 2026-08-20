@@ -729,6 +729,35 @@ class TestOrphanedPipeReconciliation:
         except (ProcessLookupError, PermissionError):
             pass
 
+    def test_reconcile_combines_kill_intent_with_concrete_signal_once(self, registry):
+        """A poll/reconcile race must not publish a requested kill as exited."""
+        proc = MagicMock()
+        proc.poll.return_value = -signal.SIGTERM
+        proc.stdout = None
+
+        s = _make_session(sid="proc_reconcile_kill_race")
+        s.process = proc
+        s.pid = 12345
+        s.notify_on_complete = True
+        s._kill_requested_source = "process.kill"
+        registry._running[s.id] = s
+
+        registry._reconcile_local_exit(s)
+        registry._reconcile_local_exit(s)
+
+        assert s.exited is True
+        assert s.exit_code == -signal.SIGTERM
+        assert s.completion_reason == "killed"
+        assert s.termination_source == "process.kill"
+        assert s.id in registry._finished
+        assert s.id not in registry._running
+
+        event = registry.completion_queue.get_nowait()
+        assert registry.completion_queue.empty()
+        assert event["exit_code"] == -signal.SIGTERM
+        assert event["completion_reason"] == "killed"
+        assert event["termination_source"] == "process.kill"
+
     def test_wait_returns_when_reader_blocked(self, registry):
         """wait() must also reconcile — not just poll()."""
         proc = subprocess.Popen(
