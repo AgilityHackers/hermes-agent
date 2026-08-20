@@ -25714,7 +25714,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)
-                if session is None or session.exited:
+                if (
+                    session is None
+                    or process_registry.terminal_snapshot(session)["exited"]
+                ):
                     break
             logger.debug("Process watcher ended (silent): %s", session_id)
             return
@@ -25731,12 +25734,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
 
-            if session.exited:
+            from tools.process_registry import process_registry as _pr_check
+            terminal = _pr_check.terminal_snapshot(session)
+            if terminal["exited"]:
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/log.
                 # poll() is read-only and intentionally does NOT mark consumed
                 # (#10156) — a status check must not suppress this delivery turn.
-                from tools.process_registry import format_process_notification, process_registry as _pr_check
+                from tools.process_registry import format_process_notification
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
@@ -25770,9 +25775,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "message_id": message_id,
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
-                        "exit_code": session.exit_code,
-                        "completion_reason": getattr(session, "completion_reason", "exited"),
-                        "termination_source": getattr(session, "termination_source", ""),
+                        "exit_code": terminal["exit_code"],
+                        "completion_reason": terminal["completion_reason"],
+                        "termination_source": terminal["termination_source"],
                         "output": _out,
                         # Spawning conversation's session-db id (stamped at
                         # spawn time in terminal_tool). Lets the delivery
@@ -25817,7 +25822,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Decide whether to notify based on mode
                 should_notify = (
                     notify_mode in {"concise", "all", "result"}
-                    or (notify_mode == "error" and session.exit_code not in {0, None})
+                    or (
+                        notify_mode == "error"
+                        and (
+                            terminal["completion_reason"] == "lost"
+                            or terminal["exit_code"] not in {0, None}
+                        )
+                    )
                 )
                 if should_notify:
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
@@ -25842,13 +25853,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_text = _format_concise_process_notification(
                             session_id,
                             _cmd_disp,
-                            session.exit_code,
+                            terminal["exit_code"],
                             new_output,
                             duration_seconds=_dur,
                         )
                     else:
                         message_text = (
-                            f"[Background process {session_id} finished with exit code {session.exit_code}~ "
+                            f"[Background process {session_id} finished with exit code {terminal['exit_code']}~ "
                             f"Here's the final output:\n{new_output}]"
                         )
                     adapter = None

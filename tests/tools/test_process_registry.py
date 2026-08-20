@@ -437,12 +437,12 @@ def test_reader_unreapable_child_is_explicitly_lost(registry):
     registry._reader_loop(session)
 
     assert session.exited is True
-    assert session.exit_code is None
+    assert session.exit_code == -1
     assert session.completion_reason == "lost"
     assert session.termination_source == "reader_wait_failed"
     completion = registry.completion_queue.get_nowait()
     assert completion["type"] == "completion"
-    assert completion["exit_code"] is None
+    assert completion["exit_code"] == -1
     assert completion["completion_reason"] == "lost"
     assert completion["termination_source"] == "reader_wait_failed"
 
@@ -570,16 +570,16 @@ def test_pty_reader_unknown_exit_status_is_explicitly_lost(registry, monkeypatch
     registry._pty_reader_loop(session)
 
     assert session.exited is True
-    assert session.exit_code is None
+    assert session.exit_code == -1
     assert session.completion_reason == "lost"
     assert session.termination_source == "pty_exit_status_unavailable"
     completion = registry.completion_queue.get_nowait()
-    assert completion["exit_code"] is None
+    assert completion["exit_code"] == -1
     assert completion["completion_reason"] == "lost"
 
 
-def test_pty_reader_signal_status_is_concrete_killed_result(registry, monkeypatch):
-    """A reaped PTY signal status is evidence, not a lost exit result."""
+def test_pty_reader_external_signal_is_concrete_exit_result(registry, monkeypatch):
+    """A reaped external PTY signal is known, but not a Hermes kill."""
 
     class _FakePty:
         exitstatus = None
@@ -602,16 +602,17 @@ def test_pty_reader_signal_status_is_concrete_killed_result(registry, monkeypatc
 
     assert session.exited is True
     assert session.exit_code == -signal.SIGTERM
-    assert session.completion_reason == "killed"
-    assert session.termination_source == "pty_signal"
+    assert session.completion_reason == "exited"
+    assert session.termination_source == "external_signal"
     completion = registry.completion_queue.get_nowait()
     assert completion["exit_code"] == -signal.SIGTERM
-    assert completion["completion_reason"] == "killed"
+    assert completion["completion_reason"] == "exited"
+    assert completion["termination_source"] == "external_signal"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY signal semantics")
-def test_real_pty_sigterm_is_killed_not_lost(registry):
-    """ptyprocess exposes signalstatus when exitstatus is None."""
+def test_real_external_pty_sigterm_is_exited_not_lost(registry):
+    """ptyprocess exposes a known external signal without kill intent."""
     from ptyprocess import PtyProcess
 
     pty = PtyProcess.spawn([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -628,11 +629,12 @@ def test_real_pty_sigterm_is_killed_not_lost(registry):
             pty.terminate(force=True)
 
     assert session.exit_code == -signal.SIGTERM
-    assert session.completion_reason == "killed"
-    assert session.termination_source == "pty_signal"
+    assert session.completion_reason == "exited"
+    assert session.termination_source == "external_signal"
     completion = registry.completion_queue.get_nowait()
     assert completion["exit_code"] == -signal.SIGTERM
-    assert completion["completion_reason"] == "killed"
+    assert completion["completion_reason"] == "exited"
+    assert completion["termination_source"] == "external_signal"
 
 
 def test_reader_combines_concrete_exit_with_kill_intent(registry):
@@ -664,6 +666,50 @@ def test_reader_combines_concrete_exit_with_kill_intent(registry):
     completion = registry.completion_queue.get_nowait()
     assert completion["exit_code"] == -signal.SIGKILL
     assert completion["completion_reason"] == "killed"
+
+
+def test_clean_exit_is_not_relabelled_by_kill_intent(registry):
+    """Intent is not effect evidence when the child exits cleanly."""
+    session = _make_session(sid="proc_clean_kill_race")
+    session._kill_requested_source = "process.kill"
+
+    terminal = registry._record_terminal_observation(session, 0)
+
+    assert terminal == {
+        "exited": True,
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+    }
+
+
+def test_terminal_snapshot_waits_for_coherent_writer_tuple(registry):
+    """Readers cannot observe fields while a writer holds the session lock."""
+    session = _make_session(sid="proc_snapshot_lock")
+    snapshot = {}
+    completed = threading.Event()
+
+    def read_snapshot():
+        snapshot.update(registry.terminal_snapshot(session))
+        completed.set()
+
+    with session._lock:
+        reader = threading.Thread(target=read_snapshot)
+        reader.start()
+        assert not completed.wait(0.05)
+        session.exited = True
+        session.exit_code = -signal.SIGTERM
+        session.completion_reason = "exited"
+        session.termination_source = "external_signal"
+
+    reader.join(timeout=1)
+    assert completed.is_set()
+    assert snapshot == {
+        "exited": True,
+        "exit_code": -signal.SIGTERM,
+        "completion_reason": "exited",
+        "termination_source": "external_signal",
+    }
 
 
 # =========================================================================
@@ -832,6 +878,20 @@ class TestReadLog:
         registry._running[s.id] = s
         result = registry.read_log(s.id, offset=10, limit=5)
         assert "5 lines" in result["showing"]
+
+    def test_terminal_log_includes_reason_code_and_source(self, registry):
+        s = _make_session(output="partial output")
+        registry._record_terminal_observation(
+            s, None, unavailable_source="reader_wait_failed"
+        )
+        registry._finished[s.id] = s
+
+        result = registry.read_log(s.id)
+
+        assert result["status"] == "exited"
+        assert result["exit_code"] == -1
+        assert result["completion_reason"] == "lost"
+        assert result["termination_source"] == "reader_wait_failed"
 
 
 # =========================================================================
@@ -1105,7 +1165,7 @@ class TestSpawnEnvSanitization:
             registry._env_poller_loop(session, FakeEnv(), "/log", "/pid", "/exit")
 
         assert session.exited is True
-        assert session.exit_code is None
+        assert session.exit_code == -1
         assert session.completion_reason == "lost"
         assert session.termination_source == "backend_exit_status_unavailable"
 
@@ -1120,7 +1180,7 @@ class TestSpawnEnvSanitization:
             registry._env_poller_loop(session, GoneEnv(), "/log", "/pid", "/exit")
 
         assert session.exited is True
-        assert session.exit_code is None
+        assert session.exit_code == -1
         assert session.completion_reason == "lost"
         assert session.termination_source == "backend_lost"
 
@@ -1408,6 +1468,34 @@ class TestKillProcess:
         assert session.completion_reason == "killed"
         assert session.termination_source == "process.kill"
 
+    def test_kill_return_preserves_clean_exit_observed_after_intent(
+        self, registry, monkeypatch
+    ):
+        """Kill intent cannot fabricate a killed API result over observed exit 0."""
+
+        class FakeProcess:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        session = _make_session(sid="proc_kill_clean_exit")
+        session.process = FakeProcess()
+        registry._running[session.id] = session
+
+        def terminate(pid, expected_start):
+            assert session._kill_requested_source == "process.kill"
+            registry._record_terminal_observation(session, 0)
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "exited"
+        assert result["exit_code"] == 0
+        assert result["completion_reason"] == "exited"
+        assert result["termination_source"] == ""
+
     def test_unsupported_recovered_kill_clears_intent_and_consumption(self, registry):
         session = _make_session(sid="proc_recovered_without_handle")
         registry._running[session.id] = session
@@ -1451,7 +1539,14 @@ class TestKillProcess:
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
                 result = registry.kill_process(s.id)
 
-            assert result["status"] == "killed"
+            assert result["status"] == "lost"
+            assert result["completion_reason"] == "lost"
+            assert result["exit_code"] == -1
+            assert result["termination_source"] == "detached_kill_result_unavailable"
+            assert s.completion_reason == "lost"
+            assert s.exit_code == -1
+            assert s.id in registry._finished
+            assert s.id not in registry._running
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
@@ -1475,12 +1570,12 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
-def test_format_lost_completion_omits_fake_null_exit_code():
+def test_format_lost_completion_omits_sentinel_exit_code():
     text = format_process_notification({
         "type": "completion",
         "session_id": "proc_lost",
         "command": "gh pr checks --watch",
-        "exit_code": None,
+        "exit_code": -1,
         "completion_reason": "lost",
         "termination_source": "detached_pid_unavailable",
         "output": "",
@@ -1755,7 +1850,7 @@ class TestPidReuseGuard:
         registry._running[s.id] = s
         refreshed = registry._refresh_detached_session(s)
         assert refreshed.exited is True
-        assert refreshed.exit_code is None
+        assert refreshed.exit_code == -1
         assert refreshed.completion_reason == "lost"
         assert refreshed.termination_source == "detached_pid_unavailable"
         assert s.id in registry._finished
@@ -1763,7 +1858,7 @@ class TestPidReuseGuard:
         assert entry["completion_reason"] == "lost"
         assert entry["termination_source"] == "detached_pid_unavailable"
         completion = registry.completion_queue.get_nowait()
-        assert completion["exit_code"] is None
+        assert completion["exit_code"] == -1
         assert completion["completion_reason"] == "lost"
         assert completion["termination_source"] == "detached_pid_unavailable"
 
@@ -2553,7 +2648,7 @@ class TestSystemdCgroupIsolation:
         assert stopped == ["hermes-worker-proc_recovered_scope.scope"]
         assert terminated == []
         assert session.exited is True
-        assert session.exit_code is None
+        assert session.exit_code == -1
         assert session.completion_reason == "lost"
         assert session.termination_source == "detached_pid_unavailable"
         assert result["completion_reason"] == "lost"

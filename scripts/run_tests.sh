@@ -39,21 +39,23 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
 # Probe local venvs first; fall back to the Nix devShell's editable venv
-# (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
-# pytest, pytest-asyncio, pytest-timeout, ruff, ty).
+# (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras).
 #
-# A candidate must have pytest INSTALLED, not merely exist. The release venv
-# at ~/.hermes/hermes-agent/venv has bin/activate but no pytest, so an
-# existence-only probe selected it in checkouts/worktrees without a local
-# .venv — every file then died with "No module named pytest" and the run
-# reported "0 tests passed" (which reads green at a glance even though the
-# exit code is 1). Skip such a venv and keep probing instead.
+# ``pytest`` alone is not a usable Hermes development test runtime. The
+# release venv can acquire pytest incidentally while still lacking
+# pytest-asyncio; selecting it makes every async test fail before product code
+# runs and turns one environment error into thousands of false failures.
 VENV=""
 VENV_PYTHON=""
 SKIPPED_VENVS=""
+
+has_test_runtime() {
+  "$1" -c 'import pytest, pytest_asyncio, prompt_toolkit' >/dev/null 2>&1
+}
+
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
   if [ -f "$candidate/bin/activate" ]; then
-    if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
+    if has_test_runtime "$candidate/bin/python"; then
       VENV="$candidate"
       VENV_PYTHON="$candidate/bin/python"
       break
@@ -65,7 +67,7 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   # Git Bash / MSYS with a `python -m venv`- or uv-created venv hits
   # this branch — without it the canonical runner refuses to start.
   if [ -f "$candidate/Scripts/activate" ]; then
-    if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
+    if has_test_runtime "$candidate/Scripts/python.exe"; then
       VENV="$candidate"
       VENV_PYTHON="$candidate/Scripts/python.exe"
       break
@@ -76,24 +78,34 @@ done
 
 if [ -n "$SKIPPED_VENVS" ]; then
   for skipped in $SKIPPED_VENVS; do
-    echo "▶ skipping venv without pytest: $skipped" >&2
+    echo "▶ skipping venv without Hermes dev test runtime (pytest + pytest-asyncio + prompt-toolkit): $skipped" >&2
   done
 fi
 
+SYSTEM_PYTHON=""
+for command_name in python3 python; do
+  command_path="$(command -v "$command_name" 2>/dev/null || true)"
+  if [ -n "$command_path" ] && has_test_runtime "$command_path"; then
+    SYSTEM_PYTHON="$command_path"
+    break
+  fi
+done
+
 if [ -n "$VENV" ]; then
   PYTHON="$VENV_PYTHON"
-elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
-    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
-  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
-  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
-  # than the devShell hook.
+elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ]     && has_test_runtime "$HERMES_PYTHON"; then
+  # HERMES_PYTHON may point at the release venv when inherited from a wrapped
+  # `hermes` binary rather than the development shell; apply the same gate.
   PYTHON="$HERMES_PYTHON"
   echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
+elif [ -n "$SYSTEM_PYTHON" ]; then
+  PYTHON="$SYSTEM_PYTHON"
+  echo "▶ no dev venv — using PATH interpreter with Hermes test runtime: $PYTHON"
 else
-  echo "error: no virtualenv with pytest found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
-  echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2
+  echo "error: no virtualenv with the Hermes dev test runtime found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
+  echo "       and neither HERMES_PYTHON nor PATH python has pytest + pytest-asyncio + prompt-toolkit" >&2
   if [ -n "$SKIPPED_VENVS" ]; then
-    echo "       (skipped for missing pytest:$SKIPPED_VENVS — install dev extras there, or create $REPO_ROOT/.venv)" >&2
+    echo "       (skipped for missing dev test runtime:$SKIPPED_VENVS — install dev extras there, or create $REPO_ROOT/.venv)" >&2
   fi
   exit 1
 fi

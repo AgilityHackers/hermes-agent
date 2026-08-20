@@ -7,6 +7,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 """
 
 import asyncio
+import signal
 import json
 import queue
 from collections import OrderedDict
@@ -217,6 +218,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     )
     session.process = MagicMock()
     session.process.pid = 4242
+    session.process.wait.return_value = -signal.SIGTERM
     registry._running[session.id] = session
     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
@@ -884,3 +886,39 @@ def test_sibling_claimed_by_other_consumer_is_not_double_delivered(
     assert "Result for deleg_owned_1" not in delivered.text
     row = async_delegation.get_durable_delegation(events[1]["delegation_id"])
     assert row["delivery_state"] == "pending"
+
+
+def test_error_mode_delivers_lost_process_completion(monkeypatch):
+    """Lost custody is an error even though its exit code is unavailable."""
+    import tools.process_registry as pr_module
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_lost_error_mode",
+        command="opaque-worker",
+        started_at=1.0,
+        output_buffer="result unavailable",
+    )
+    registry._record_terminal_observation(
+        session, None, unavailable_source="backend_lost"
+    )
+    registry._finished[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(), send=AsyncMock())
+    runner = _runner(adapter)
+    runner._load_background_notifications_mode = lambda: "error"
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "platform": "telegram",
+        "chat_id": "123",
+    }))
+
+    adapter.send.assert_awaited_once()
+    assert "result unavailable" in adapter.send.await_args.args[1]

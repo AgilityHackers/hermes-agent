@@ -299,8 +299,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
 
     config = _silent_bg_base_config(tmp_path)
     dummy_env = SimpleNamespace(env={})
+    spawn_kwargs = {}
 
     def fake_spawn_local(**kwargs):
+        spawn_kwargs.update(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -320,6 +322,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    terminal_tool_module._test_spawn_kwargs = spawn_kwargs
     return terminal_tool_module
 
 
@@ -348,6 +351,26 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
         "Hint must explain the failure mode, not just suggest the fix"
     )
 
+
+
+def test_background_notification_flags_are_forwarded_before_spawn(monkeypatch, tmp_path):
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    try:
+        json.loads(
+            tt.terminal_tool(
+                command="pytest tests/",
+                background=True,
+                notify_on_complete=True,
+                watch_patterns=["DONE"],
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert tt._test_spawn_kwargs["notify_on_complete"] is True
+    # notify_on_complete wins the documented mutual-exclusion rule.
+    assert tt._test_spawn_kwargs["watch_patterns"] == []
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
     """The correct shape — bg+notify together — must not nag."""

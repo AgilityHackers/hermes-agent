@@ -38,6 +38,15 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return self._consumed
 
+    def terminal_snapshot(self, session):
+        """Mirror the terminal fields consumed by the gateway watcher."""
+        return {
+            "exited": session.exited,
+            "exit_code": session.exit_code,
+            "completion_reason": getattr(session, "completion_reason", "exited"),
+            "termination_source": getattr(session, "termination_source", ""),
+        }
+
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     """Create a GatewayRunner with a fake config for the given mode."""

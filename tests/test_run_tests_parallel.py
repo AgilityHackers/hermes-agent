@@ -460,3 +460,103 @@ def test_drive_letter_colon_is_not_a_path_separator(tmp_path: Path) -> None:
         f"drive letter split off as a phantom root:\n{proc.stdout}"
     )
     assert "Discovered 1 test files" in proc.stdout, proc.stdout
+
+
+# ── Machine-readable completion contract ────────────────────────────────────
+
+def _run_with_result_json(probe: Path, result_path: Path) -> subprocess.CompletedProcess:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--files",
+            str(probe),
+            "--result-json",
+            str(result_path),
+            "--file-retries",
+            "0",
+            "-j",
+            "1",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_result_json_records_success_atomically(tmp_path: Path) -> None:
+    probe = tmp_path / "test_result_success.py"
+    probe.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    result_path = tmp_path / "nested" / "result.json"
+
+    proc = _run_with_result_json(probe, result_path)
+
+    assert proc.returncode == 0, proc.stdout
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["command"][0] == sys.executable
+    assert str(probe) in payload["command"]
+    assert payload["git_head"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parent.parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert isinstance(payload["worktree_clean_before"], bool)
+    assert payload["returncode"] == 0
+    assert payload["files_total"] == 1
+    assert payload["files_passed"] == 1
+    assert payload["files_failed"] == 0
+    assert payload["tests_passed"] == 1
+    assert payload["tests_failed"] == 0
+    assert payload["failed_files"] == []
+    assert not list(result_path.parent.glob(".*.tmp"))
+
+
+def test_result_json_records_failure_without_test_output(tmp_path: Path) -> None:
+    probe = tmp_path / "test_result_failure.py"
+    probe.write_text(
+        "def test_bad():\n    assert False, 'sensitive failure detail'\n",
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "result.json"
+
+    proc = _run_with_result_json(probe, result_path)
+
+    assert proc.returncode == 1
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["returncode"] == 1
+    assert payload["files_failed"] == 1
+    assert payload["tests_failed"] == 1
+    assert payload["failed_files"][0]["path"] == str(probe)
+    assert payload["failed_files"][0]["summary"]["failed"] == 1
+    assert "sensitive failure detail" not in result_path.read_text(encoding="utf-8")
+    assert not list(result_path.parent.glob(".*.tmp"))
+
+
+def test_runner_fails_on_new_checkout_pollution(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    pollution = repo_root / f".runner-pollution-{os.getpid()}"
+    probe = tmp_path / "test_pollution_probe.py"
+    probe.write_text(
+        "from pathlib import Path\n\n"
+        f"def test_pollutes_checkout():\n    Path({str(pollution)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    result_path = tmp_path / "result.json"
+
+    try:
+        proc = _run_with_result_json(probe, result_path)
+        assert proc.returncode == 1, proc.stdout
+        assert "CHECKOUT POLLUTION" in proc.stdout
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        assert payload["returncode"] == 1
+        assert any(str(pollution.name) in entry for entry in payload["checkout_pollution"])
+    finally:
+        pollution.unlink(missing_ok=True)

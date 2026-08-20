@@ -103,6 +103,56 @@ _DEFAULT_FILE_RETRIES = 1
 _DURATIONS_FILE = "test_durations.json"
 
 
+def _write_result_json(path_value: str, payload: dict) -> None:
+    """Atomically persist the bounded machine-readable run result."""
+    path = Path(path_value).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _worktree_status(repo_root: Path) -> set[str] | None:
+    """Return bounded Git status entries, or None outside a usable checkout."""
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {
+        line
+        for line in proc.stdout.splitlines()
+        if line and line[3:] != _DURATIONS_FILE
+    }
+
+
+def _git_head(repo_root: Path) -> str | None:
+    """Return the source HEAD used by this run, or None outside Git."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = proc.stdout.strip()
+    return head if proc.returncode == 0 and head else None
+
+
 def _split_pathspec(value: str) -> List[str]:
     """Split a separator-joined path list (``--paths``/``--files``/
     ``HERMES_TEST_PATHS``) into individual paths.
@@ -797,6 +847,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--result-json",
+        metavar="PATH",
+        help=(
+            "Atomically write a bounded machine-readable completion record "
+            "with return code, counts, duration, and failed files."
+        ),
+    )
+    parser.add_argument(
         "--slice",
         metavar="I/N",
         help=(
@@ -858,6 +916,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--result-json",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -958,6 +1017,9 @@ def main() -> int:
             sys.exit(2)
 
     repo_root = Path(__file__).resolve().parent.parent
+    initial_worktree_status = _worktree_status(repo_root)
+    source_git_head = _git_head(repo_root)
+    invocation = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
 
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
@@ -1195,6 +1257,16 @@ def main() -> int:
         for f, t in slowest:
             print(f"    {t:>6.2f}s  {_format_file(f, repo_root)}")
 
+    final_worktree_status = _worktree_status(repo_root)
+    checkout_pollution = sorted(
+        final_worktree_status - initial_worktree_status
+    ) if initial_worktree_status is not None and final_worktree_status is not None else []
+    if checkout_pollution:
+        print()
+        print("=== ✗ CHECKOUT POLLUTION — the test run introduced Git status entries ===")
+        for entry in checkout_pollution:
+            print(f"  {entry}")
+
     if failures:
         print()
         print("=== Failure output ===")
@@ -1223,12 +1295,42 @@ def main() -> int:
             print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
-        return 1
+    return_code = 1 if failures or no_tests_ran_at_all or checkout_pollution else 0
+    if args.result_json:
+        _write_result_json(
+            args.result_json,
+            {
+                "schema_version": 1,
+                "command": invocation,
+                "git_head": source_git_head,
+                "worktree_clean_before": initial_worktree_status == set(),
+                "returncode": return_code,
+                "duration_seconds": round(elapsed, 6),
+                "workers": args.jobs,
+                "files_total": len(files),
+                "files_passed": pass_count,
+                "files_failed": fail_count,
+                "tests_passed": tests_passed,
+                "tests_failed": tests_failed,
+                "tests_skipped": tests_skipped,
+                "tests_collected": tests_collected,
+                "no_tests_ran": no_tests_ran_at_all,
+                "checkout_pollution": checkout_pollution,
+                "failed_files": [
+                    {
+                        "path": _format_file(file, repo_root),
+                        "summary": summary,
+                    }
+                    for file, _output, summary in failures
+                ],
+                "flaky_files": [
+                    _format_file(file, repo_root)
+                    for file, _output in _FLAKY_RESULTS
+                ],
+            },
+        )
 
-    if no_tests_ran_at_all:
-        return 1
-
-    return 0
+    return return_code
 
 
 if __name__ == "__main__":

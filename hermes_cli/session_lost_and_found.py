@@ -104,6 +104,7 @@ def _cli_supports_recover(binary: str) -> bool:
         probe = subprocess.run(
             [binary, "-readonly", str(scratch), ".recover"],
             capture_output=True,
+            cwd=scratch_dir,
             timeout=30,
         )
         if probe.returncode != 0:
