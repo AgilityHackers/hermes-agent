@@ -1,5 +1,6 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import io
 import json
 import os
 import signal
@@ -577,6 +578,94 @@ def test_pty_reader_unknown_exit_status_is_explicitly_lost(registry, monkeypatch
     assert completion["completion_reason"] == "lost"
 
 
+def test_pty_reader_signal_status_is_concrete_killed_result(registry, monkeypatch):
+    """A reaped PTY signal status is evidence, not a lost exit result."""
+
+    class _FakePty:
+        exitstatus = None
+        signalstatus = signal.SIGTERM
+
+        def isalive(self):
+            return False
+
+        def wait(self):
+            return None
+
+    session = _make_session(sid="proc_pty_sigterm")
+    session._pty = _FakePty()
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+
+    registry._pty_reader_loop(session)
+
+    assert session.exited is True
+    assert session.exit_code == -signal.SIGTERM
+    assert session.completion_reason == "killed"
+    assert session.termination_source == "pty_signal"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["exit_code"] == -signal.SIGTERM
+    assert completion["completion_reason"] == "killed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY signal semantics")
+def test_real_pty_sigterm_is_killed_not_lost(registry):
+    """ptyprocess exposes signalstatus when exitstatus is None."""
+    from ptyprocess import PtyProcess
+
+    pty = PtyProcess.spawn([sys.executable, "-c", "import time; time.sleep(30)"])
+    session = _make_session(sid="proc_real_pty_sigterm")
+    session._pty = pty
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+
+    try:
+        os.kill(pty.pid, signal.SIGTERM)
+        registry._pty_reader_loop(session)
+    finally:
+        if pty.isalive():
+            pty.terminate(force=True)
+
+    assert session.exit_code == -signal.SIGTERM
+    assert session.completion_reason == "killed"
+    assert session.termination_source == "pty_signal"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["exit_code"] == -signal.SIGTERM
+    assert completion["completion_reason"] == "killed"
+
+
+def test_reader_combines_concrete_exit_with_kill_intent(registry):
+    """A reader that wins the kill race must publish killed with real status."""
+
+    class _KilledProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"")
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    session = _make_session(sid="proc_reader_kill_race")
+    session.process = _KilledProcess()
+    session._kill_requested_source = "process.kill"
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+
+    registry._reader_loop(session)
+
+    assert session.exit_code == -signal.SIGKILL
+    assert session.completion_reason == "killed"
+    assert session.termination_source == "process.kill"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["exit_code"] == -signal.SIGKILL
+    assert completion["completion_reason"] == "killed"
+
+
 # =========================================================================
 # Orphaned-pipe reconciliation (issue #17327)
 # =========================================================================
@@ -969,6 +1058,43 @@ class TestSpawnEnvSanitization:
         assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
         assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
 
+    def test_env_poller_missing_exit_status_is_explicitly_lost(self, registry):
+        session = _make_session(sid="proc_env_no_status")
+
+        class FakeEnv:
+            def __init__(self):
+                self._responses = iter([
+                    {"output": ""},
+                    {"output": "1\n"},
+                    {"output": ""},
+                ])
+
+            def execute(self, command, **kwargs):
+                return next(self._responses)
+
+        with patch("tools.process_registry.time.sleep", return_value=None):
+            registry._env_poller_loop(session, FakeEnv(), "/log", "/pid", "/exit")
+
+        assert session.exited is True
+        assert session.exit_code is None
+        assert session.completion_reason == "lost"
+        assert session.termination_source == "backend_exit_status_unavailable"
+
+    def test_env_poller_backend_disappearance_is_explicitly_lost(self, registry):
+        session = _make_session(sid="proc_env_gone")
+
+        class GoneEnv:
+            def execute(self, command, **kwargs):
+                raise RuntimeError("backend disappeared")
+
+        with patch("tools.process_registry.time.sleep", return_value=None):
+            registry._env_poller_loop(session, GoneEnv(), "/log", "/pid", "/exit")
+
+        assert session.exited is True
+        assert session.exit_code is None
+        assert session.completion_reason == "lost"
+        assert session.termination_source == "backend_lost"
+
 
 # =========================================================================
 # Popen leak prevention
@@ -1223,6 +1349,46 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+
+    def test_kill_intent_precedes_termination_and_preserves_observed_code(
+        self, registry, monkeypatch
+    ):
+        class FakeProcess:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        session = _make_session(sid="proc_kill_race")
+        session.process = FakeProcess()
+        registry._running[session.id] = session
+
+        def terminate(pid, expected_start):
+            assert session._kill_requested_source == "process.kill"
+            # Simulate the reader reaping SIGKILL before kill_process resumes.
+            session.exited = True
+            session.exit_code = -signal.SIGKILL
+            session.completion_reason = "killed"
+            session.termination_source = session._kill_requested_source
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert session.exit_code == -signal.SIGKILL
+        assert session.completion_reason == "killed"
+        assert session.termination_source == "process.kill"
+
+    def test_unsupported_recovered_kill_clears_intent_and_consumption(self, registry):
+        session = _make_session(sid="proc_recovered_without_handle")
+        registry._running[session.id] = session
+
+        result = registry.kill_process(session.id, consume_output=True)
+
+        assert result["status"] == "error"
+        assert session._kill_requested_source == ""
+        assert session.id not in registry._completion_consumed
+        assert session.id in registry._running
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")

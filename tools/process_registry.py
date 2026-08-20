@@ -419,6 +419,9 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    # Non-terminal intent set before a potentially blocking kill operation.
+    # Readers use it only after observing a concrete child terminal status.
+    _kill_requested_source: str = field(default="", repr=False)
 
 
 class ProcessRegistry:
@@ -1449,15 +1452,19 @@ class ProcessRegistry:
                     wait_failed = session.process.poll() is None
                 except Exception:
                     wait_failed = True
-            session.exited = True
-            if session.completion_reason != "killed":
+            with session._lock:
+                session.exited = True
                 if wait_failed:
                     session.exit_code = None
                     session.completion_reason = "lost"
                     session.termination_source = "reader_wait_failed"
                 else:
                     session.exit_code = session.process.returncode
-                    session.completion_reason = "exited"
+                    if session._kill_requested_source:
+                        session.completion_reason = "killed"
+                        session.termination_source = session._kill_requested_source
+                    elif session.completion_reason != "killed":
+                        session.completion_reason = "exited"
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -1500,21 +1507,32 @@ class ProcessRegistry:
                     )
                     exit_str = exit_result.get("output", "").strip()
                     try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
+                        exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
-                        session.exit_code = -1
-                    session.exited = True
-                    if session.completion_reason != "killed":
-                        session.completion_reason = "exited"
+                        exit_code = None
+                    with session._lock:
+                        session.exited = True
+                        session.exit_code = exit_code
+                        if exit_code is None:
+                            session.completion_reason = "lost"
+                            session.termination_source = "backend_exit_status_unavailable"
+                        elif session._kill_requested_source:
+                            session.completion_reason = "killed"
+                            session.termination_source = session._kill_requested_source
+                        elif session.completion_reason != "killed":
+                            session.completion_reason = "exited"
                     self._move_to_finished(session)
                     return
 
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
+                # Environment might be gone (sandbox reaped, etc.). A kill
+                # request is intent, not proof of effect; unavailable custody
+                # therefore remains an explicit lost result.
+                with session._lock:
+                    session.exited = True
+                    session.exit_code = None
+                    session.completion_reason = "lost"
+                    session.termination_source = "backend_lost"
                 self._move_to_finished(session)
                 return
 
@@ -1563,15 +1581,27 @@ class ProcessRegistry:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
-        session.exited = True
-        if session.completion_reason != "killed":
-            exit_code = pty.exitstatus if hasattr(pty, "exitstatus") else None
-            session.exit_code = exit_code
-            if exit_code is None:
+        with session._lock:
+            session.exited = True
+            exit_code = getattr(pty, "exitstatus", None)
+            signal_status = getattr(pty, "signalstatus", None)
+            if isinstance(signal_status, int):
+                session.exit_code = -signal_status
+                session.completion_reason = "killed"
+                session.termination_source = (
+                    session._kill_requested_source or "pty_signal"
+                )
+            elif isinstance(exit_code, int):
+                session.exit_code = exit_code
+                if session._kill_requested_source:
+                    session.completion_reason = "killed"
+                    session.termination_source = session._kill_requested_source
+                elif session.completion_reason != "killed":
+                    session.completion_reason = "exited"
+            else:
+                session.exit_code = None
                 session.completion_reason = "lost"
                 session.termination_source = "pty_exit_status_unavailable"
-            else:
-                session.completion_reason = "exited"
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -2130,6 +2160,14 @@ class ProcessRegistry:
                 self._completion_consumed.add(session_id)
             return result
 
+        # Record kill intent before the potentially blocking termination call.
+        # Reader/poller threads may observe the concrete exit first; they combine
+        # that observed status with this intent rather than publishing `exited`.
+        with session._lock:
+            session._kill_requested_source = source
+            if consume_output:
+                self._completion_consumed.add(session_id)
+
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
             if session._pty:
@@ -2176,6 +2214,10 @@ class ProcessRegistry:
                     }
                 self._terminate_host_pid(session.pid, session.host_start_time)
             else:
+                with session._lock:
+                    session._kill_requested_source = ""
+                if consume_output:
+                    self._completion_consumed.discard(session_id)
                 return {
                     "status": "error",
                     "error": (
@@ -2201,7 +2243,8 @@ class ProcessRegistry:
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
-                session.exit_code = -15  # SIGTERM
+                if session.exit_code is None:
+                    session.exit_code = -15  # Best available result without reader status.
                 session.completion_reason = "killed"
                 session.termination_source = source
             self._move_to_finished(session)
@@ -2214,6 +2257,10 @@ class ProcessRegistry:
                 "output": output,
             }
         except Exception as e:
+            with session._lock:
+                session._kill_requested_source = ""
+            if consume_output:
+                self._completion_consumed.discard(session_id)
             return {"status": "error", "error": str(e)}
 
     def write_stdin(self, session_id: str, data: str) -> dict:
