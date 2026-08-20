@@ -1556,6 +1556,7 @@ class TestPidReuseGuard:
         s.pid_scope = "host"
         s.detached = True
         s.host_start_time = wrong_start  # ...identity no longer matches
+        s.notify_on_complete = True
         registry._running[s.id] = s
         refreshed = registry._refresh_detached_session(s)
         assert refreshed.exited is True
@@ -1566,6 +1567,10 @@ class TestPidReuseGuard:
         entry = next(item for item in registry.list_sessions() if item["session_id"] == s.id)
         assert entry["completion_reason"] == "lost"
         assert entry["termination_source"] == "detached_pid_unavailable"
+        completion = registry.completion_queue.get_nowait()
+        assert completion["exit_code"] is None
+        assert completion["completion_reason"] == "lost"
+        assert completion["termination_source"] == "detached_pid_unavailable"
 
 
 @pytest.mark.skipif(sys.platform == "win32",
