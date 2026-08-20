@@ -2698,6 +2698,10 @@ export interface Translations {
     mcpSetup: {
       connectTitle: (connectors: string) => string
       connectAction: string
+      retryAction: string
+      done: string
+      summary: (connected: number, total: number) => string
+      phase: Record<'adding' | 'enabling' | 'installing' | 'probing' | 'signing_in', string>
       decline: string
       dismiss: string
       declined: string

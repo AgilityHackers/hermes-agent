@@ -3295,6 +3295,16 @@ export const zh: Translations = {
     mcpSetup: {
       connectTitle: connectors => `连接 ${connectors}？`,
       connectAction: '连接',
+      retryAction: '重试',
+      done: '完成',
+      summary: (connected, total) => `已连接 ${connected}/${total}。`,
+      phase: {
+        adding: '添加中…',
+        enabling: '启用中…',
+        installing: '安装中…',
+        probing: '检查中…',
+        signing_in: '登录中…'
+      },
       decline: '暂不',
       dismiss: '关闭',
       declined: '已拒绝',

@@ -21,6 +21,7 @@ import {
   type Connector,
   ConnectorCancelled,
   type ConnectorState,
+  type ConnectPhase,
   invalidateConnectorCache,
   loadConnectorStates,
   resolveConnectors
@@ -30,6 +31,7 @@ import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import {
+  buildSetupOutcome,
   clearMcpSetupRequest,
   type McpConnectorOutcome,
   type McpSetupOutcome,
@@ -55,6 +57,14 @@ import { parseMaybeObject } from './tool/fallback-model/format'
  * what lets a no-auth server be a plain switch and an OAuth one open a
  * browser tab from the same click, with no branching here.
  *
+ * Each row also owns its own *recovery*. Three connectors is three OAuth
+ * flows against three servers — under the MCP auth spec a token is bound to
+ * one resource, so partial failure is a property of the protocol and the card
+ * only gets to choose whether it represents it honestly. So: one shared
+ * Connect is a convenience that fans out into N independent attempts, a pass
+ * that leaves anything unconnected keeps the card live with Retry over just
+ * those rows, and the tool settles only on a clean sweep or an explicit Done.
+ *
  * Consent vocabulary follows the approval bar: primary-tinted action with
  * `⌘⏎`, ghost decline with `Esc`, clarify's focus stand-down so keystrokes
  * meant for the composer are never eaten.
@@ -67,10 +77,6 @@ interface SetupArgs {
   action: SetupAction
   reason: string
 }
-
-// Thrown by the in-flight flow when the user cancels — the declined respond
-// has already been sent, so the catch path must swallow this, not report it.
-const CANCELLED = Symbol('mcp-setup-cancelled')
 
 function readSetupArgs(args: unknown): SetupArgs {
   const row = parseMaybeObject(args)
@@ -245,15 +251,28 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
   const [rows, setRows] = useState<null | RowModel[]>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
-  const [phases, setPhases] = useState<Record<string, RowPhase>>({})
-  const [working, setWorking] = useState(false)
+  // Terminal per-row results, accumulated ACROSS passes so a retry only has
+  // to cover what's still outstanding and an earlier success can't be undone.
+  const [results, setResults] = useState<Record<string, McpConnectorOutcome>>({})
+  const [inFlight, setInFlight] = useState<null | { name: string; phase: ConnectPhase }>(null)
+  const [running, setRunning] = useState(false)
+  const [attempted, setAttempted] = useState(false)
   const [envDraft, setEnvDraft] = useState<Record<string, string>>({})
   const [envOpen, setEnvOpen] = useState(false)
   const [unresolved, setUnresolved] = useState<string[]>([])
   // Set when the user cancels mid-flight (a stuck OAuth tab, a hung install).
-  // The in-flight flow checks it at every boundary and aborts via the
-  // CANCELLED sentinel; the declined respond has already been sent by then.
+  // The in-flight pass checks it at every boundary and stops there; the
+  // respond carrying whatever had already landed has been sent by then.
   const cancelRef = useRef(false)
+  // `results` is what renders; this is what's true *right now*. A pass commits
+  // each row the moment it settles, so Esc halfway through still reports the
+  // connectors that already succeeded instead of reading a stale closure.
+  const resultsRef = useRef<Record<string, McpConnectorOutcome>>({})
+
+  const commitResult = useCallback((name: string, outcome: McpConnectorOutcome) => {
+    resultsRef.current = { ...resultsRef.current, [name]: outcome }
+    setResults(resultsRef.current)
+  }, [])
 
   // Resolve the offered names down the connector ladder (catalog → curated
   // directory → public registry) and read their current state, once.
@@ -349,34 +368,62 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     [copy.gatewayDisconnected, copy.reloadFailed, copy.sendFailed, gateway, request]
   )
 
+  const settle = useCallback(
+    async (final: Record<string, McpConnectorOutcome>) => {
+      await respond(
+        buildSetupOutcome({
+          attempted,
+          names: (rows ?? []).map(row => row.connector.name),
+          results: final,
+          selected,
+          server: names[0] ?? ''
+        })
+      )
+    },
+    [attempted, names, respond, rows, selected]
+  )
+
   const decline = useCallback(() => {
-    // While a flow is in flight this is a CANCEL: answer declined right away
-    // and let the abandoned work notice via cancelRef at its next boundary.
+    // While a pass is in flight this is a CANCEL: answer with what landed so
+    // far and let the abandoned work notice via cancelRef at its next
+    // boundary. Connectors that already succeeded stay reported as connected.
     cancelRef.current = true
     triggerHaptic('cancel')
-    void respond({
-      connectors: (rows ?? []).map(row => ({ server: row.connector.name, status: 'declined' as const })),
-      server: names[0] ?? '',
-      status: 'declined'
-    })
-  }, [names, respond, rows])
+    void settle(resultsRef.current)
+  }, [settle])
 
   const chosen = useMemo(() => (rows ?? []).filter(row => selected[row.connector.name]), [rows, selected])
 
-  // Credentials the chosen rows declare but the user hasn't filled in yet.
+  /** Chosen rows that still aren't connected — the target of Connect, and of
+   *  every subsequent Retry. */
+  const outstanding = useMemo(
+    () => chosen.filter(row => results[row.connector.name]?.status !== 'connected'),
+    [chosen, results]
+  )
+
+  // Credentials the still-unconnected rows declare but the user hasn't filled
+  // in yet. Scoped to `outstanding` so a row that already landed never
+  // re-prompts for a key on the next pass.
   const missingEnv = useMemo(
     () =>
-      chosen.flatMap(row =>
+      outstanding.flatMap(row =>
         row.state === 'not_configured'
           ? row.connector.requiredEnv.filter(env => env.required && !envDraft[env.name]?.trim())
           : []
       ),
-    [chosen, envDraft]
+    [envDraft, outstanding]
   )
 
   const approve = useCallback(async () => {
     if (chosen.length === 0) {
       decline()
+
+      return
+    }
+
+    if (outstanding.length === 0) {
+      // Everything wanted is already connected — Done.
+      await settle(resultsRef.current)
 
       return
     }
@@ -389,86 +436,70 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     }
 
     cancelRef.current = false
-    setWorking(true)
+    setRunning(true)
+    setAttempted(true)
 
-    const outcomes: McpConnectorOutcome[] = []
+    let landed = false
 
     try {
       // Sequential on purpose: two OAuth tabs racing for focus is hostile,
       // and each connector's result should paint before the next starts.
-      for (const row of chosen) {
+      for (const row of outstanding) {
         if (cancelRef.current) {
-          outcomes.push({ server: row.connector.name, status: 'skipped' })
-
-          continue
+          break
         }
 
-        setPhases(current => ({ ...current, [row.connector.name]: 'working' }))
+        const name = row.connector.name
+
+        setInFlight({ name, phase: 'adding' })
 
         try {
           const result = await connectConnector(row.connector, row.state, {
             cancelled: () => cancelRef.current,
-            env: envDraft
+            env: envDraft,
+            onPhase: phase => setInFlight(current => (current?.name === name ? { name, phase } : current))
           })
 
-          setPhases(current => ({ ...current, [row.connector.name]: 'done' }))
-          outcomes.push({ server: row.connector.name, status: 'connected', tools: result.tools })
+          commitResult(name, { server: name, status: 'connected', tools: result.tools })
+          landed = true
         } catch (error) {
           if (error instanceof ConnectorCancelled || error instanceof McpOAuthCancelled) {
-            setPhases(current => ({ ...current, [row.connector.name]: 'idle' }))
-            outcomes.push({ server: row.connector.name, status: 'skipped' })
-            // One cancelled sign-in shouldn't silently abandon the rest, but
-            // it usually means "stop" — honor that and skip the remainder.
-            cancelRef.current = true
-
+            // A closed sign-in tab says nothing about the other connectors, so
+            // it leaves this row retryable and the pass carries on. Esc is the
+            // way to stop everything.
             continue
           }
 
-          setPhases(current => ({ ...current, [row.connector.name]: 'failed' }))
-          outcomes.push({
+          commitResult(name, {
             detail: error instanceof Error ? error.message : String(error),
-            server: row.connector.name,
+            server: name,
             status: 'error'
           })
+        } finally {
+          setInFlight(null)
         }
       }
-
-      // Rows the user switched off are reported so the agent knows they were
-      // offered and passed over, not lost.
-      for (const row of rows ?? []) {
-        if (!selected[row.connector.name]) {
-          outcomes.push({ server: row.connector.name, status: 'skipped' })
-        }
-      }
-
-      const connected = outcomes.filter(outcome => outcome.status === 'connected').length
-      const failed = outcomes.some(outcome => outcome.status === 'error')
-
-      if (connected > 0) {
-        triggerHaptic('submit')
-      }
-
-      await respond({
-        connectors: outcomes,
-        server: names[0] ?? '',
-        status: connected === 0 ? (failed ? 'error' : 'declined') : failed ? 'partial' : 'connected'
-      })
     } catch (error) {
-      if (error === CANCELLED) {
-        return
-      }
-
       notifyError(error, copy.failed(names[0] ?? ''))
-      await respond({
-        connectors: outcomes,
-        detail: error instanceof Error ? error.message : String(error),
-        server: names[0] ?? '',
-        status: 'error'
-      })
     } finally {
-      setWorking(false)
+      setRunning(false)
     }
-  }, [chosen, copy, decline, envDraft, missingEnv, names, respond, rows, selected])
+
+    if (cancelRef.current) {
+      // Esc already answered the tool with whatever had landed.
+      return
+    }
+
+    if (landed) {
+      triggerHaptic('submit')
+    }
+
+    // Only a clean sweep settles on its own. Anything left unconnected keeps
+    // the card live so its row — and only its row — can be retried.
+    if (chosen.every(row => resultsRef.current[row.connector.name]?.status === 'connected')) {
+      await settle(resultsRef.current)
+    }
+  }, [chosen, commitResult, copy, decline, envDraft, missingEnv, names, outstanding, settle])
 
   // ⌘/Ctrl+Enter → approve, Esc → decline/cancel. Same accelerators, same
   // guard shape as the approval bar (tool/approval.tsx). Unlike approve, Esc
@@ -496,7 +527,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       }
 
       if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-        if (!working) {
+        if (!running) {
           event.preventDefault()
           void approve()
         }
@@ -509,7 +540,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     window.addEventListener('keydown', onKeyDown, true)
 
     return () => window.removeEventListener('keydown', onKeyDown, true)
-  }, [approve, decline, ready, working])
+  }, [approve, decline, ready, running])
 
   const title = copy.connectTitle(
     rows && rows.length > 0 ? rows.map(row => row.connector.title).join(', ') : names.map(prettyName).join(', ')
@@ -550,9 +581,14 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
   const multi = rows.length > 1
 
-  const envFields = chosen.flatMap(row =>
+  const envFields = outstanding.flatMap(row =>
     row.state === 'not_configured' ? row.connector.requiredEnv.map(env => ({ ...env, owner: row.connector })) : []
   )
+
+  const connectedCount = chosen.filter(row => results[row.connector.name]?.status === 'connected').length
+  // A pass ran and left something behind: the card stays live, the action
+  // becomes Retry over just those rows, and the decline becomes Done.
+  const incomplete = attempted && !running && outstanding.length > 0
 
   return (
     <div className={cn(SHELL_CLASS, 'my-1.5 grid gap-2')} data-slot="mcp-setup-inline">
@@ -562,19 +598,33 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       </div>
 
       <div className="grid gap-1" data-slot="mcp-setup-rows">
-        {rows.map(row => (
-          <ConnectorRow
-            checked={selected[row.connector.name] ?? false}
-            copy={copy}
-            key={row.connector.name}
-            onToggle={next => setSelected(current => ({ ...current, [row.connector.name]: next }))}
-            phase={phases[row.connector.name] ?? 'idle'}
-            row={row}
-            showSwitch={multi}
-            working={working}
-          />
-        ))}
+        {rows.map(row => {
+          const outcome = results[row.connector.name]
+          const live = inFlight?.name === row.connector.name
+
+          return (
+            <ConnectorRow
+              checked={selected[row.connector.name] ?? false}
+              copy={copy}
+              detail={outcome?.status === 'error' ? outcome.detail : undefined}
+              key={row.connector.name}
+              locked={outcome?.status === 'connected'}
+              onToggle={next => setSelected(current => ({ ...current, [row.connector.name]: next }))}
+              phase={live ? 'working' : outcome?.status === 'connected' ? 'done' : outcome ? 'failed' : 'idle'}
+              phaseLabel={live ? copy.phase[inFlight.phase] : undefined}
+              row={row}
+              showSwitch={multi}
+              working={running}
+            />
+          )
+        })}
       </div>
+
+      {/* Exact counts, not "some failed" — and the per-row reason stays on the
+          row, because a summary alone makes the user hunt for what broke. */}
+      {incomplete && (
+        <p className="text-[0.6875rem] text-(--ui-text-tertiary)">{copy.summary(connectedCount, chosen.length)}</p>
+      )}
 
       {unresolved.length > 0 && (
         <p className="text-[0.6875rem] text-(--ui-text-tertiary)">
@@ -609,24 +659,26 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         <div className="inline-flex h-6 items-stretch overflow-hidden rounded-md border border-primary/25 bg-primary/10 text-primary">
           <Button
             className="h-full gap-1 rounded-none px-2 text-xs font-medium text-primary hover:bg-primary/15 hover:text-primary"
-            disabled={working || chosen.length === 0}
+            disabled={running || chosen.length === 0}
             onClick={() => void approve()}
             size="xs"
             variant="ghost"
           >
-            {working ? <Loader2 className="size-3 animate-spin" /> : copy.connectAction}
-            {!working && <span className="text-[0.625rem] text-primary/60">{isMac ? '⌘⏎' : 'Ctrl⏎'}</span>}
+            {running ? <Loader2 className="size-3 animate-spin" /> : incomplete ? copy.retryAction : copy.connectAction}
+            {!running && <span className="text-[0.625rem] text-primary/60">{isMac ? '⌘⏎' : 'Ctrl⏎'}</span>}
           </Button>
         </div>
         {/* Never disabled: while a flow is in flight this is the cancel —
-            a stuck OAuth tab or hung install must always have a way out. */}
+            a stuck OAuth tab or hung install must always have a way out.
+            Once something has landed it becomes Done: leaving with two of
+            three connected is a real answer, not a decline. */}
         <Button
           className="h-6 gap-1.5 rounded-md px-1.5 text-xs font-normal text-(--ui-text-tertiary) hover:text-foreground"
           onClick={decline}
           size="xs"
           variant="ghost"
         >
-          {working ? t.common.cancel : copy.decline}
+          {running ? t.common.cancel : connectedCount > 0 ? copy.done : copy.decline}
           <span className="text-[0.625rem] opacity-55">Esc</span>
         </Button>
       </div>
@@ -637,16 +689,22 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 function ConnectorRow({
   checked,
   copy,
+  detail,
+  locked,
   onToggle,
   phase,
+  phaseLabel,
   row,
   showSwitch,
   working
 }: {
   checked: boolean
   copy: ReturnType<typeof useI18n>['t']['assistant']['mcpSetup']
+  detail?: string
+  locked: boolean
   onToggle: (next: boolean) => void
   phase: RowPhase
+  phaseLabel?: string
   row: RowModel
   showSwitch: boolean
   working: boolean
@@ -676,9 +734,17 @@ function ConnectorRow({
         <div className="flex flex-wrap items-baseline gap-x-1.5">
           <span className="font-medium">{connector.title}</span>
           <TrustBadge connector={connector} copy={copy} />
-          {stateLabel && <span className="text-[0.6875rem] text-(--ui-text-tertiary)">{stateLabel}</span>}
+          {/* While a row is working its phase replaces the resting state —
+              "Signing in…" is the one the user needs, because the browser
+              tab that just took focus is otherwise unexplained. */}
+          {phaseLabel ? (
+            <span className="text-[0.6875rem] text-(--ui-text-tertiary)">{phaseLabel}</span>
+          ) : (
+            stateLabel && <span className="text-[0.6875rem] text-(--ui-text-tertiary)">{stateLabel}</span>
+          )}
         </div>
         {connector.description ? <p className="truncate text-(--ui-text-secondary)">{connector.description}</p> : null}
+        {detail ? <p className="text-[0.6875rem] text-destructive">{detail}</p> : null}
         <p className="truncate text-[0.6875rem] text-(--ui-text-tertiary)">{endpoint}</p>
       </div>
 
@@ -687,7 +753,7 @@ function ConnectorRow({
           aria-label={connector.title}
           checked={checked}
           className="mt-0.5 shrink-0 cursor-pointer"
-          disabled={working}
+          disabled={working || locked}
           onCheckedChange={onToggle}
           size="xs"
         />

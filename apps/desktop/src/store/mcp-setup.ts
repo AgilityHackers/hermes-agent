@@ -41,6 +41,46 @@ export interface McpSetupOutcome {
   detail?: string
 }
 
+/**
+ * Fold a card's per-row results into the answer the tool gets.
+ *
+ * The aggregate is derived, never authoritative: `connectors` is the truth and
+ * `status` only summarizes it, so a card that connected two of three reports
+ * `partial` with both successes intact rather than collapsing to one verdict.
+ *
+ * Rows with no result are filled in by intent. A row still switched on when
+ * the user walked away without ever running a pass is `declined` — they said
+ * no. Everything else (switched off, or abandoned partway through a pass) is
+ * `skipped`, which tells the agent it was offered and passed over rather than
+ * refused.
+ */
+export function buildSetupOutcome(input: {
+  attempted: boolean
+  names: string[]
+  results: Record<string, McpConnectorOutcome>
+  selected: Record<string, boolean>
+  server: string
+}): McpSetupOutcome {
+  const { attempted, names, results, selected, server } = input
+
+  const connectors: McpConnectorOutcome[] = names.map(
+    name =>
+      results[name] ?? {
+        server: name,
+        status: selected[name] && !attempted ? 'declined' : 'skipped'
+      }
+  )
+
+  const connected = connectors.filter(connector => connector.status === 'connected').length
+  const failed = connectors.some(connector => connector.status === 'error')
+
+  return {
+    connectors,
+    server,
+    status: connected === 0 ? (failed ? 'error' : 'declined') : failed ? 'partial' : 'connected'
+  }
+}
+
 const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $mcpSetupRequests = atom<Record<string, McpSetupRequest>>({})

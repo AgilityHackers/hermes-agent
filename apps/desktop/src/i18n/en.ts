@@ -3132,6 +3132,16 @@ export const en: Translations = {
     mcpSetup: {
       connectTitle: connectors => `Connect ${connectors}?`,
       connectAction: 'Connect',
+      retryAction: 'Retry',
+      done: 'Done',
+      summary: (connected, total) => `${connected} of ${total} connected.`,
+      phase: {
+        adding: 'Adding…',
+        enabling: 'Enabling…',
+        installing: 'Installing…',
+        probing: 'Checking…',
+        signing_in: 'Signing in…'
+      },
       decline: 'Not now',
       dismiss: 'Dismiss',
       declined: 'Declined',
