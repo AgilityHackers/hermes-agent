@@ -366,6 +366,46 @@ def test_reader_failure_waits_for_real_child_exit_before_completion(registry, mo
     assert completion["exit_code"] == 0
 
 
+def test_reader_waits_for_real_subprocess_after_stdout_closes(registry):
+    """Real child closure of stdout is not the same as child completion."""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys, time; "
+                "os.close(sys.stdout.fileno()); "
+                "time.sleep(0.2); "
+                "raise SystemExit(7)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    session = _make_session(sid="proc_reader_real_child")
+    session.process = proc
+    session.pid = proc.pid
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+
+    started = time.monotonic()
+    try:
+        registry._reader_loop(session)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    elapsed = time.monotonic() - started
+    assert elapsed >= 0.15
+    assert session.exited is True
+    assert session.exit_code == 7
+    assert session.completion_reason == "exited"
+    completion = registry.completion_queue.get_nowait()
+    assert completion["exit_code"] == 7
+    assert completion["completion_reason"] == "exited"
+
+
 def test_reader_unreapable_child_is_explicitly_lost(registry):
     """A failed wait/poll is classified, never serialized as plain exited/null."""
 
