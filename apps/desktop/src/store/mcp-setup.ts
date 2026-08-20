@@ -11,21 +11,34 @@ import { $gateway } from './gateway'
  */
 export interface McpSetupRequest {
   requestId: string
-  /** Catalog name (install) or mcp_servers config name (enable/authorize). */
+  /** First connector — kept alongside `servers` for anything reading a scalar. */
   server: string
-  action: 'authorize' | 'enable' | 'install'
-  /** Agent-supplied one-liner: why this server helps right now. */
+  /** Every connector the card should offer, in the order the agent asked. */
+  servers: string[]
+  /** `connect` lets the card resolve the step from each connector's real
+   *  state; the others are the agent naming one specific step. */
+  action: 'authorize' | 'connect' | 'enable' | 'install'
+  /** Agent-supplied one-liner: why these help right now. */
   reason: string
   sessionId: string | null
 }
 
-/** The card's answer, serialized back through `mcp.setup.respond`. */
-export interface McpSetupOutcome {
-  status: 'authorized' | 'declined' | 'enabled' | 'error' | 'installed'
+/** One connector's result inside a card's answer. */
+export interface McpConnectorOutcome {
   server: string
+  status: 'connected' | 'declined' | 'error' | 'skipped'
   detail?: string
-  /** Tool names now available (OAuth flows report them). */
+  /** Tool names the connector brought in, when the flow learned them. */
   tools?: string[]
+}
+
+/** The card's answer, serialized back through `mcp.setup.respond`.
+ *  `status` is the aggregate; `connectors` is the per-row truth. */
+export interface McpSetupOutcome {
+  status: 'connected' | 'declined' | 'error' | 'partial'
+  server: string
+  connectors: McpConnectorOutcome[]
+  detail?: string
 }
 
 const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
@@ -107,7 +120,11 @@ export async function skipMcpSetupRequest(sessionId: string | null | undefined):
   try {
     await $gateway.get()?.request('mcp.setup.respond', {
       request_id: request.requestId,
-      result: JSON.stringify({ server: request.server, status: 'declined' })
+      result: JSON.stringify({
+        connectors: request.servers.map(server => ({ server, status: 'declined' })),
+        server: request.server,
+        status: 'declined'
+      })
     })
   } catch {
     // The tool times out on its own; a failed skip must never swallow the

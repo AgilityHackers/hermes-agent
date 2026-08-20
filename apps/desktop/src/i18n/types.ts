@@ -2687,22 +2687,27 @@ export interface Translations {
       lateAnswerHint: string
     }
     mcpSetup: {
-      installTitle: (server: string) => string
-      enableTitle: (server: string) => string
-      authorizeTitle: (server: string) => string
-      installAction: string
-      enableAction: string
-      authorizeAction: string
+      connectTitle: (connectors: string) => string
+      connectAction: string
       decline: string
+      dismiss: string
       declined: string
-      installed: (server: string) => string
-      enabled: (server: string) => string
-      authorized: (server: string) => string
+      declinedOne: (server: string) => string
+      connected: (server: string) => string
+      skipped: (server: string) => string
       failed: (server: string) => string
       unanswered: string
       toolCount: (count: number) => string
-      notInCatalog: (server: string) => string
+      notFound: (connectors: string) => string
       catalogSource: string
+      stateDisabled: string
+      stateNeedsAuth: string
+      trustCatalog: string
+      trustOfficial: string
+      trustVerified: (publisher: string) => string
+      trustVerifiedTip: (publisher: string) => string
+      trustCommunity: string
+      trustCommunityTip: string
       envRequired: string
       sendFailed: string
       reloadFailed: string

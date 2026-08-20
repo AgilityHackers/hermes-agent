@@ -1463,6 +1463,31 @@ export interface McpCatalogResponse {
   diagnostics: { name: string; kind: string; message: string }[]
 }
 
+/** One hosted connector from `GET /api/mcp/registry/search` — the tier below
+ *  the reviewed catalog. Always a remote endpoint: the backend drops package
+ *  launchers before they reach here, so nothing in this shape can run code. */
+export interface McpRegistryEntry {
+  /** Config-safe short name ("notion"). */
+  name: string
+  /** Fully-qualified registry identity ("com.notion/mcp"). */
+  registry_name: string
+  title: string
+  description: string
+  url: string
+  transport: string
+  /** `verified` = the publisher's namespace owns the endpoint's domain. */
+  trust: 'community' | 'verified'
+  /** Registrable domain the namespace asserts ("notion.com"), or "". */
+  publisher: string
+  website: string
+  version: string
+  headers: { name: string; description: string; required: boolean; secret: boolean }[]
+}
+
+export interface McpRegistrySearchResponse {
+  entries: McpRegistryEntry[]
+}
+
 /** `GET /api/memory` — active provider + built-in memory file sizes. */
 export interface MemoryStatusResponse {
   active: string
