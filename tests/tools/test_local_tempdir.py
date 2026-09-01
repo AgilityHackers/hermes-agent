@@ -9,7 +9,8 @@ class TestLocalTempDir:
         monkeypatch.delenv("TMP", raising=False)
         monkeypatch.delenv("TEMP", raising=False)
 
-        with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+        with patch("tools.environments.local.measure_free_inode_ratio", return_value=0.12), \
+             patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
             env = LocalEnvironment(cwd=".", timeout=10)
 
         assert env.get_temp_dir() == "/data/data/com.termux/files/usr/tmp"
@@ -25,6 +26,7 @@ class TestLocalTempDir:
         with patch("tools.environments.local.os.path.isdir", return_value=False), \
              patch("tools.environments.local.os.access", return_value=False), \
              patch("tools.environments.local.tempfile.gettempdir", return_value="/cache/tmp"), \
+             patch("tools.environments.local.measure_free_inode_ratio", return_value=0.12), \
              patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
             env = LocalEnvironment(cwd=".", timeout=10)
             assert env.get_temp_dir() == "/cache/tmp"

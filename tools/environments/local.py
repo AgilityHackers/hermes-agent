@@ -17,6 +17,17 @@ from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.environments.snapshot_lifecycle import (
+    DEFER,
+    FAIL_CLOSED,
+    RUN,
+    cleanup_owned_artifacts,
+    decide_inode_admission,
+    measure_free_inode_ratio,
+    prepare_owned_artifacts,
+    reap_stale_owned_artifacts,
+    settings_from_environment,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -43,6 +54,11 @@ _terminal_temp_prune_lock = threading.Lock()
 _terminal_temp_pruned_once = False
 
 _BG_GROUP_RE = re.compile(r"^(hermes_bg_[A-Za-z0-9_-]+)\.(log|pid|exit)$")
+_OWNED_SNAPSHOT_PREFIXES = (
+    "hermes-snap-",
+    "hermes-cwd-",
+    "hermes-session-",
+)
 
 
 def _default_terminal_temp_dir() -> "Path | None":
@@ -91,6 +107,11 @@ def cleanup_terminal_temp_cache(
             group_newest[key] = max(group_newest.get(key, 0.0), mt)
 
     for f in entries:
+        # Snapshot artifacts have their own exact owner-marker lifecycle.
+        # Never bulk-delete a name match: lookalikes, foreign markers and
+        # symlinks must survive for explicit inspection.
+        if f.name.startswith(_OWNED_SNAPSHOT_PREFIXES):
+            continue
         try:
             mt = f.stat().st_mtime
         except OSError:
@@ -2006,6 +2027,40 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
+        self._owned_snapshot_artifacts = None
+        settings = settings_from_environment()
+        temp_root = Path(self._snapshot_path).parent
+        reaped = reap_stale_owned_artifacts(temp_root, settings)
+        if reaped:
+            logger.info("Reaped %d stale owned snapshot session(s)", len(reaped))
+
+        admission = decide_inode_admission(
+            measure_free_inode_ratio(temp_root),
+            settings,
+        )
+        self._snapshot_inode_admission = admission
+        if admission.outcome == FAIL_CLOSED:
+            raise RuntimeError(
+                "Local terminal snapshot creation refused: "
+                f"{admission.reason} (free_inode_ratio={admission.free_inode_ratio!r})"
+            )
+        if admission.outcome == DEFER:
+            logger.warning(
+                "Local terminal snapshot deferred under inode pressure "
+                "(free_inode_ratio=%s); using a login shell per command",
+                admission.free_inode_ratio,
+            )
+            return
+        if admission.outcome != RUN:
+            raise RuntimeError(f"Unknown snapshot admission outcome: {admission.outcome}")
+
+        owned = prepare_owned_artifacts(temp_root, self._session_id)
+        if (
+            owned.snapshot_path != self._snapshot_path
+            or owned.cwd_path != self._cwd_file
+        ):
+            raise RuntimeError("snapshot owner marker path mismatch")
+        self._owned_snapshot_artifacts = owned
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -2338,6 +2393,15 @@ class LocalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Clean up temp files."""
+        owned = getattr(self, "_owned_snapshot_artifacts", None)
+        if owned is not None:
+            cleanup_owned_artifacts(owned)
+            if not Path(owned.marker_path).exists():
+                self._owned_snapshot_artifacts = None
+            return
+
+        # Backward-compatible cleanup for objects constructed without the
+        # owner-marker lifecycle (tests, older persisted processes).
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)
