@@ -16,7 +16,7 @@ import socket
 import stat
 import time
 import uuid
-from typing import Callable
+from typing import Callable, cast
 
 RUN = "RUN"
 DEFER = "DEFER_NEW_SNAPSHOT"
@@ -31,6 +31,8 @@ class SnapshotLifecycleSettings:
     ttl_seconds: float = 86_400.0
     min_free_inode_ratio: float = 0.15
     critical_free_inode_ratio: float = 0.10
+    min_free_inodes: int = 10_000
+    critical_free_inodes: int = 1_000
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,13 @@ class InodeAdmission:
     outcome: str
     reason: str
     free_inode_ratio: float | None
+    free_inodes: int | None = None
+
+
+@dataclass(frozen=True)
+class InodeHeadroom:
+    free_inode_ratio: float | None
+    free_inodes: int | None
 
 
 @dataclass(frozen=True)
@@ -63,52 +72,100 @@ def settings_from_environment() -> SnapshotLifecycleSettings:
         except ValueError:
             return float("nan")
 
+    def _int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return -1
+
     return SnapshotLifecycleSettings(
         ttl_seconds=_float("TERMINAL_SNAPSHOT_TTL_SECONDS", 86_400.0),
         min_free_inode_ratio=_float("TERMINAL_SNAPSHOT_MIN_FREE_INODE_RATIO", 0.15),
         critical_free_inode_ratio=_float(
             "TERMINAL_SNAPSHOT_CRITICAL_FREE_INODE_RATIO", 0.10
         ),
+        min_free_inodes=_int("TERMINAL_SNAPSHOT_MIN_FREE_INODES", 10_000),
+        critical_free_inodes=_int("TERMINAL_SNAPSHOT_CRITICAL_FREE_INODES", 1_000),
     )
 
 
 def decide_inode_admission(
     free_inode_ratio: float | None,
     settings: SnapshotLifecycleSettings,
+    *,
+    free_inodes: int | None = None,
 ) -> InodeAdmission:
-    """Pure decision core for snapshot creation."""
+    """Pure decision core using relative pressure plus absolute headroom.
+
+    Quota/container views can expose a very small ``f_favail / f_files`` ratio
+    while still providing millions of usable inodes.  Ratio-only defaults would
+    disable the terminal on such hosts.  Absolute low headroom remains decisive;
+    a low ratio is pressure only when absolute headroom is also low or unknown.
+    """
     critical = settings.critical_free_inode_ratio
     minimum = settings.min_free_inode_ratio
     if (
         not all(math.isfinite(value) for value in (critical, minimum, settings.ttl_seconds))
         or not (0 <= critical < minimum <= 1)
         or settings.ttl_seconds < 0
+        or isinstance(settings.min_free_inodes, bool)
+        or isinstance(settings.critical_free_inodes, bool)
+        or not isinstance(settings.min_free_inodes, int)
+        or not isinstance(settings.critical_free_inodes, int)
+        or not (0 <= settings.critical_free_inodes < settings.min_free_inodes)
     ):
-        return InodeAdmission(FAIL_CLOSED, "INVALID_THRESHOLDS", free_inode_ratio)
+        return InodeAdmission(FAIL_CLOSED, "INVALID_THRESHOLDS", free_inode_ratio, free_inodes)
+    ratio_valid = (
+        free_inode_ratio is not None
+        and math.isfinite(free_inode_ratio)
+        and 0 <= free_inode_ratio <= 1
+    )
+    count_valid = (
+        free_inodes is not None
+        and not isinstance(free_inodes, bool)
+        and isinstance(free_inodes, int)
+        and free_inodes >= 0
+    )
+    ratio_value = float(cast(float, free_inode_ratio)) if ratio_valid else None
+    count_value = int(cast(int, free_inodes)) if count_valid else None
+    if not ratio_valid and not count_valid:
+        return InodeAdmission(
+            FAIL_CLOSED, "INODE_MEASUREMENT_UNAVAILABLE", free_inode_ratio, free_inodes
+        )
+    if count_value is not None and count_value < settings.critical_free_inodes:
+        return InodeAdmission(FAIL_CLOSED, "INODES_CRITICAL", free_inode_ratio, free_inodes)
     if (
-        free_inode_ratio is None
-        or not math.isfinite(free_inode_ratio)
-        or not (0 <= free_inode_ratio <= 1)
+        ratio_value is not None
+        and ratio_value < critical
+        and (count_value is None or count_value < settings.min_free_inodes)
     ):
-        return InodeAdmission(FAIL_CLOSED, "INODE_MEASUREMENT_UNAVAILABLE", free_inode_ratio)
-    if free_inode_ratio < critical:
-        return InodeAdmission(FAIL_CLOSED, "INODES_CRITICAL", free_inode_ratio)
-    if free_inode_ratio <= minimum:
-        return InodeAdmission(DEFER, "INODE_PRESSURE", free_inode_ratio)
-    return InodeAdmission(RUN, "INODES_AVAILABLE", free_inode_ratio)
+        return InodeAdmission(FAIL_CLOSED, "INODES_CRITICAL", free_inode_ratio, free_inodes)
+    if count_value is not None and count_value <= settings.min_free_inodes:
+        return InodeAdmission(DEFER, "INODE_PRESSURE", free_inode_ratio, free_inodes)
+    if ratio_value is not None and ratio_value <= minimum and count_value is None:
+        return InodeAdmission(DEFER, "INODE_PRESSURE", free_inode_ratio, free_inodes)
+    return InodeAdmission(RUN, "INODES_AVAILABLE", free_inode_ratio, free_inodes)
 
 
-def measure_free_inode_ratio(path: str | Path) -> float | None:
-    """Measure POSIX inode headroom; inode admission is not applicable on Windows."""
+def measure_inode_headroom(path: str | Path) -> InodeHeadroom:
+    """Measure POSIX inode ratio and absolute unprivileged headroom once."""
     if os.name == "nt":
-        return 1.0
+        return InodeHeadroom(1.0, 2**31 - 1)
     try:
         values = os.statvfs(os.fspath(path))
     except (AttributeError, OSError):
-        return None
+        return InodeHeadroom(None, None)
     if values.f_files <= 0:
-        return None
-    return values.f_favail / values.f_files
+        return InodeHeadroom(None, int(values.f_favail))
+    return InodeHeadroom(values.f_favail / values.f_files, int(values.f_favail))
+
+
+def measure_free_inode_ratio(path: str | Path) -> float | None:
+    """Compatibility wrapper for callers that need only the ratio."""
+    return measure_inode_headroom(path).free_inode_ratio
 
 
 def _paths(root: Path, session_id: str) -> tuple[Path, Path, Path]:
@@ -150,10 +207,12 @@ def prepare_owned_artifacts(
     uid: int | None = None,
     hostname: str | None = None,
 ) -> OwnedArtifacts:
-    root = Path(temp_root)
-    if root.is_symlink() or not root.is_dir():
+    try:
+        root = Path(temp_root).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"snapshot temp root is not a real directory: {temp_root}") from exc
+    if not root.is_dir():
         raise RuntimeError(f"snapshot temp root is not a real directory: {root}")
-    root = root.resolve()
     snapshot, cwd, marker = _paths(root, session_id)
     created_at = time.time() if now is None else float(now)
     process_id = os.getpid() if pid is None else int(pid)
@@ -265,10 +324,12 @@ def reap_stale_owned_artifacts(
     pid_alive: Callable[[int], bool] = _pid_alive,
 ) -> list[str]:
     """Reap TTL-expired, dead, self-owned sessions; refuse every ambiguous entry."""
-    root = Path(temp_root)
-    if root.is_symlink() or not root.is_dir() or settings.ttl_seconds < 0:
+    try:
+        root = Path(temp_root).resolve(strict=True)
+    except OSError:
         return []
-    root = root.resolve()
+    if not root.is_dir() or settings.ttl_seconds < 0:
+        return []
     current = time.time() if now is None else float(now)
     if uid is None and hasattr(os, "getuid"):
         uid = os.getuid()

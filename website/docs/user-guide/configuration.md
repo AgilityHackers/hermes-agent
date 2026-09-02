@@ -180,6 +180,8 @@ terminal:
   snapshot_ttl_seconds: 86400
   snapshot_min_free_inode_ratio: 0.15
   snapshot_critical_free_inode_ratio: 0.10
+  snapshot_min_free_inodes: 10000       # Low-ratio hosts still run with ample absolute headroom
+  snapshot_critical_free_inodes: 1000   # Refuse only when absolute headroom is critically low
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy

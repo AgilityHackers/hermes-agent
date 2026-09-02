@@ -3938,6 +3938,8 @@ TERMINAL_CONFIG_ENV_MAP = {
     "snapshot_ttl_seconds": "TERMINAL_SNAPSHOT_TTL_SECONDS",
     "snapshot_min_free_inode_ratio": "TERMINAL_SNAPSHOT_MIN_FREE_INODE_RATIO",
     "snapshot_critical_free_inode_ratio": "TERMINAL_SNAPSHOT_CRITICAL_FREE_INODE_RATIO",
+    "snapshot_min_free_inodes": "TERMINAL_SNAPSHOT_MIN_FREE_INODES",
+    "snapshot_critical_free_inodes": "TERMINAL_SNAPSHOT_CRITICAL_FREE_INODES",
     "timeout": "TERMINAL_TIMEOUT",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",

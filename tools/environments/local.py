@@ -23,7 +23,7 @@ from tools.environments.snapshot_lifecycle import (
     RUN,
     cleanup_owned_artifacts,
     decide_inode_admission,
-    measure_free_inode_ratio,
+    measure_inode_headroom,
     prepare_owned_artifacts,
     reap_stale_owned_artifacts,
     settings_from_environment,
@@ -68,6 +68,23 @@ def _default_terminal_temp_dir() -> "Path | None":
         return get_hermes_home() / "cache" / "terminal"
     except Exception:
         return None
+
+
+def _resolve_real_temp_root(candidate: str) -> str | None:
+    """Return an accessible real directory, resolving safe directory aliases.
+
+    macOS commonly exposes ``/tmp`` as a symlink to ``/private/tmp``. Resolve
+    once before snapshot paths are created so ownership checks operate on one
+    stable path rather than on an alias that can change independently.
+    """
+    try:
+        root = Path(candidate).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not root.is_dir() or not os.access(root, os.W_OK | os.X_OK):
+        return None
+    rendered = str(root)
+    return rendered.rstrip("/") or "/"
 
 
 def cleanup_terminal_temp_cache(
@@ -2034,21 +2051,25 @@ class LocalEnvironment(BaseEnvironment):
         if reaped:
             logger.info("Reaped %d stale owned snapshot session(s)", len(reaped))
 
+        headroom = measure_inode_headroom(temp_root)
         admission = decide_inode_admission(
-            measure_free_inode_ratio(temp_root),
+            headroom.free_inode_ratio,
             settings,
+            free_inodes=headroom.free_inodes,
         )
         self._snapshot_inode_admission = admission
         if admission.outcome == FAIL_CLOSED:
             raise RuntimeError(
                 "Local terminal snapshot creation refused: "
-                f"{admission.reason} (free_inode_ratio={admission.free_inode_ratio!r})"
+                f"{admission.reason} (free_inode_ratio={admission.free_inode_ratio!r}, "
+                f"free_inodes={admission.free_inodes!r})"
             )
         if admission.outcome == DEFER:
             logger.warning(
                 "Local terminal snapshot deferred under inode pressure "
-                "(free_inode_ratio=%s); using a login shell per command",
+                "(free_inode_ratio=%s, free_inodes=%s); using a login shell per command",
                 admission.free_inode_ratio,
+                admission.free_inodes,
             )
             return
         if admission.outcome != RUN:
@@ -2113,13 +2134,17 @@ class LocalEnvironment(BaseEnvironment):
         # Honored ahead of the generic TMPDIR so users can redirect Hermes' temp
         # root to real storage when /tmp is a small tmpfs.
         configured = self.env.get("TERMINAL_TEMP_DIR") or os.environ.get("TERMINAL_TEMP_DIR")
-        if configured and configured.startswith("/") and os.path.isdir(configured):
-            return configured.rstrip("/") or "/"
+        if configured and configured.startswith("/"):
+            resolved = _resolve_real_temp_root(configured)
+            if resolved:
+                return resolved
 
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):
-                return candidate.rstrip("/") or "/"
+                resolved = _resolve_real_temp_root(candidate)
+                if resolved:
+                    return resolved
 
         # Default: HERMES_HOME/cache/terminal — real storage, mirroring the
         # Windows branch above. /tmp is only a last-resort fallback now
@@ -2128,19 +2153,22 @@ class LocalEnvironment(BaseEnvironment):
             from hermes_constants import get_hermes_home
             cache_dir = get_hermes_home() / "cache" / "terminal"
             cache_dir.mkdir(parents=True, exist_ok=True)
-            resolved = str(cache_dir)
-            if resolved.startswith("/") and os.access(resolved, os.W_OK | os.X_OK):
+            resolved = _resolve_real_temp_root(str(cache_dir))
+            if resolved:
                 _prune_terminal_temp_once()
-                return resolved.rstrip("/") or "/"
+                return resolved
         except Exception:
             pass
 
-        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
-            return "/tmp"
+        resolved_tmp = _resolve_real_temp_root("/tmp")
+        if resolved_tmp:
+            return resolved_tmp
 
         candidate = tempfile.gettempdir()
         if candidate.startswith("/"):
-            return candidate.rstrip("/") or "/"
+            resolved = _resolve_real_temp_root(candidate)
+            if resolved:
+                return resolved
 
         return "/tmp"
 

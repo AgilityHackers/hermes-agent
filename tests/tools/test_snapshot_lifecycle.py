@@ -13,6 +13,7 @@ from tools.environments.snapshot_lifecycle import (
     FAIL_CLOSED,
     DEFER,
     RUN,
+    InodeHeadroom,
     SnapshotLifecycleSettings,
     cleanup_owned_artifacts,
     decide_inode_admission,
@@ -58,6 +59,39 @@ def test_invalid_thresholds_fail_closed():
     assert result.reason == "INVALID_THRESHOLDS"
 
 
+def test_low_ratio_with_ample_absolute_headroom_runs():
+    result = decide_inode_admission(0.0276, _settings(), free_inodes=1_600_000)
+    assert result.outcome == RUN
+    assert result.reason == "INODES_AVAILABLE"
+
+
+def test_critically_low_absolute_headroom_fails_even_with_high_ratio():
+    result = decide_inode_admission(0.80, _settings(), free_inodes=999)
+    assert result.outcome == FAIL_CLOSED
+    assert result.reason == "INODES_CRITICAL"
+
+
+def test_low_absolute_headroom_defers_snapshot():
+    result = decide_inode_admission(0.80, _settings(), free_inodes=5_000)
+    assert result.outcome == DEFER
+    assert result.reason == "INODE_PRESSURE"
+
+
+def test_absolute_headroom_can_admit_when_ratio_is_unavailable():
+    result = decide_inode_admission(None, _settings(), free_inodes=100_000)
+    assert result.outcome == RUN
+
+
+def test_invalid_absolute_thresholds_fail_closed():
+    result = decide_inode_admission(
+        0.80,
+        _settings(min_free_inodes=1_000, critical_free_inodes=1_000),
+        free_inodes=100_000,
+    )
+    assert result.outcome == FAIL_CLOSED
+    assert result.reason == "INVALID_THRESHOLDS"
+
+
 @pytest.mark.parametrize("ttl", [float("nan"), float("inf"), -1.0])
 def test_invalid_ttl_fails_closed(ttl):
     result = decide_inode_admission(0.5, _settings(ttl_seconds=ttl))
@@ -82,6 +116,26 @@ def test_prepare_writes_private_owner_marker(tmp_path):
     assert payload["pid"] == 4321
     assert Path(owned.snapshot_path).parent == tmp_path
     assert Path(owned.cwd_path).parent == tmp_path
+
+
+def test_symlink_temp_root_resolves_to_stable_real_directory(tmp_path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(real_root, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    owned = prepare_owned_artifacts(
+        alias,
+        "a1b2c3d4e5f6",
+        hostname="test-host",
+    )
+
+    assert Path(owned.marker_path).parent == real_root
+    assert Path(owned.snapshot_path).parent == real_root
+    cleanup_owned_artifacts(owned)
 
 
 def test_cleanup_removes_only_exact_owned_artifacts(tmp_path):
@@ -188,7 +242,10 @@ def test_stale_reaper_refuses_lookalike_foreign_and_symlink_markers(tmp_path):
 
 def test_local_environment_run_band_owns_and_cleans_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(LocalEnvironment, "get_temp_dir", lambda _self: str(tmp_path))
-    monkeypatch.setattr("tools.environments.local.measure_free_inode_ratio", lambda _path: 0.20)
+    monkeypatch.setattr(
+        "tools.environments.local.measure_inode_headroom",
+        lambda _path: InodeHeadroom(0.20, 100_000),
+    )
 
     def fake_init(self):
         Path(self._snapshot_path).write_text("snapshot")
@@ -211,7 +268,10 @@ def test_local_environment_run_band_owns_and_cleans_snapshot(tmp_path, monkeypat
 
 def test_local_environment_defer_band_uses_no_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(LocalEnvironment, "get_temp_dir", lambda _self: str(tmp_path))
-    monkeypatch.setattr("tools.environments.local.measure_free_inode_ratio", lambda _path: 0.12)
+    monkeypatch.setattr(
+        "tools.environments.local.measure_inode_headroom",
+        lambda _path: InodeHeadroom(0.12, 5_000),
+    )
     called = []
     monkeypatch.setattr(LocalEnvironment, "init_session", lambda _self: called.append(True))
 
@@ -225,7 +285,10 @@ def test_local_environment_defer_band_uses_no_snapshot(tmp_path, monkeypatch):
 
 def test_local_environment_critical_band_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(LocalEnvironment, "get_temp_dir", lambda _self: str(tmp_path))
-    monkeypatch.setattr("tools.environments.local.measure_free_inode_ratio", lambda _path: 0.05)
+    monkeypatch.setattr(
+        "tools.environments.local.measure_inode_headroom",
+        lambda _path: InodeHeadroom(0.05, 500),
+    )
     called = []
     monkeypatch.setattr(LocalEnvironment, "init_session", lambda _self: called.append(True))
 

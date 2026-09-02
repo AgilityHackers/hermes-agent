@@ -211,6 +211,8 @@ def test_snapshot_lifecycle_settings_are_bridged_everywhere():
         "snapshot_ttl_seconds",
         "snapshot_min_free_inode_ratio",
         "snapshot_critical_free_inode_ratio",
+        "snapshot_min_free_inodes",
+        "snapshot_critical_free_inodes",
     }
     assert required <= _cli_env_map_keys()
     assert required <= _gateway_env_map_keys()
