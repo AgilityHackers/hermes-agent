@@ -276,6 +276,14 @@ def _quote_bash_path(path: str) -> str:
     return shlex.quote(_bash_safe_path(path))
 
 
+def _snapshot_paths_equal(left: str, right: str) -> bool:
+    """Compare snapshot paths without treating Windows separators as identity."""
+    path_module = ntpath if _IS_WINDOWS else os.path
+    return path_module.normcase(path_module.normpath(left)) == path_module.normcase(
+        path_module.normpath(right)
+    )
+
+
 def _cwd_usable(path: str) -> bool:
     """True when *path* is a directory this process can actually chdir into.
 
@@ -2077,8 +2085,8 @@ class LocalEnvironment(BaseEnvironment):
 
         owned = prepare_owned_artifacts(temp_root, self._session_id)
         if (
-            owned.snapshot_path != self._snapshot_path
-            or owned.cwd_path != self._cwd_file
+            not _snapshot_paths_equal(owned.snapshot_path, self._snapshot_path)
+            or not _snapshot_paths_equal(owned.cwd_path, self._cwd_file)
         ):
             raise RuntimeError("snapshot owner marker path mismatch")
         self._owned_snapshot_artifacts = owned
