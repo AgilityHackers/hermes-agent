@@ -4001,6 +4001,20 @@
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
 
+    // Agent-review requests (operator feature): clicking an Ask button on a card
+    // posts a "ask the <agent> to review" comment; the request runner picks it up
+    // and the agent's result is posted back as a comment on this card.
+    const askReview = function (taskId, agentKey) {
+      const url = withBoard(`${API}/tasks/${encodeURIComponent(taskId)}/comments`, props.boardSlug);
+      return SDK.fetchJSON(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: "ask the " + agentKey + " to review" }),
+      }).then(function () {
+        if (props.onRefresh) props.onRefresh();
+      });
+    };
+
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
@@ -4045,6 +4059,7 @@
         onPatch: props.onPatch,
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
+        onAskReview: askReview,
       }),
       h(DiagnosticsSection, {
         task: t,
@@ -4748,6 +4763,26 @@
       }, label);
     };
 
+    // Ask-an-agent buttons (operator feature): one click posts a review request
+    // comment on this card; the request runner picks it up and the agent's
+    // result is posted back as a comment. See askReview in TaskDetail.
+    const [askNote, setAskNote] = useState(null);
+    const askBtn = function (label, agentKey) {
+      return h(Button, {
+        onClick: function () {
+          if (!props.onAskReview) return;
+          setAskNote({ ok: true, text: "Requesting " + agentKey + " review…" });
+          Promise.resolve(props.onAskReview(task.id, agentKey)).then(function () {
+            setAskNote({ ok: true, text: "Requested: " + agentKey + " review — the result will appear under Comments." });
+          }).catch(function (err) {
+            setAskNote({ ok: false, text: "Request failed: " + ((err && err.message) || err) });
+          });
+        },
+        size: "sm",
+        title: "Ask the " + agentKey + " review lane to review this card. The request is queued automatically; the result is posted here as a comment.",
+      }, label);
+    };
+
     // "Specify" appears only when the task is in the Triage column — the
     // one column where an auxiliary LLM pass is meaningful. Elsewhere
     // the backend would return ok:false with "not in triage" anyway,
@@ -4850,6 +4885,9 @@
           getDestructiveConfirm(t, "done")),
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
           getDestructiveConfirm(t, "archived")),
+        askBtn("Ask contrarian", "contrarian"),
+        askBtn("Ask purist", "purist"),
+        askBtn("Ask observer", "observer"),
       ),
       specifyMsg ? h("div", {
         className: specifyMsg.ok
@@ -4861,6 +4899,11 @@
           ? "hermes-kanban-msg-ok"
           : "hermes-kanban-msg-err",
       }, decomposeMsg.text) : null,
+      askNote ? h("div", {
+        className: askNote.ok
+          ? "hermes-kanban-msg-ok"
+          : "hermes-kanban-msg-err",
+      }, askNote.text) : null,
     );
   }
 
