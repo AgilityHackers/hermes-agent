@@ -4006,10 +4006,13 @@
     // and the agent's result is posted back as a comment on this card.
     const askReview = function (taskId, agentKey) {
       const url = withBoard(`${API}/tasks/${encodeURIComponent(taskId)}/comments`, props.boardSlug);
+      const bodyText = agentKey === "merge"
+        ? "ask the merge worker family to review and approve"
+        : "ask the " + agentKey + " to review";
       return SDK.fetchJSON(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: "ask the " + agentKey + " to review" }),
+        body: JSON.stringify({ body: bodyText }),
       }).then(function () {
         if (props.onRefresh) props.onRefresh();
       });
@@ -4888,6 +4891,7 @@
         askBtn("Ask contrarian", "contrarian"),
         askBtn("Ask purist", "purist"),
         askBtn("Ask observer", "observer"),
+        askBtn("Ask merge review", "merge"),
       ),
       specifyMsg ? h("div", {
         className: specifyMsg.ok
