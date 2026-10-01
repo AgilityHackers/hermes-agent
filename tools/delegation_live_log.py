@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import shutil
 import threading
 import time
@@ -284,6 +286,52 @@ def update_manifest_statuses(delegation_id: Optional[str],
                     task["exit_reason"] = r["exit_reason"]
         manifest["completed"] = time.strftime(_TIME_FMT)
         _dump_json(mp, manifest)
+
+
+def reconcile_terminal_manifest(delegation_id: str, statuses: Dict[int, str]) -> bool:
+    """Project settled ledger results onto a stale live transcript manifest.
+
+    The ledger is authoritative. Only a task still labelled ``running`` is
+    changed; a separately completed child's status is never overwritten. A
+    missing or malformed cache file is harmless, and the replacement is atomic
+    so a Desktop reader never sees half-written JSON. This does not restart a
+    child, revoke a lease, or change the ledger.
+    """
+    if not re.fullmatch(r"deleg_[0-9a-f]{8}(?:-\d+)?", delegation_id or ""):
+        return False
+    if not statuses:
+        return False
+    path = _manifest_path(delegation_id)
+    staged = None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+        if manifest.get("delegation_id") != delegation_id or not isinstance(manifest.get("tasks"), list):
+            return False
+        changed = False
+        for task in manifest["tasks"]:
+            if not isinstance(task, dict) or task.get("status") != "running":
+                continue
+            index = task.get("index")
+            status = statuses.get(index) if isinstance(index, int) else None
+            if isinstance(status, str) and status not in ("running", "finalizing", ""):
+                task["status"] = status
+                changed = True
+        if not changed:
+            return False
+        manifest["completed"] = time.strftime(_TIME_FMT)
+        staged = path.with_name(f".manifest.recovered.{uuid.uuid4().hex}")
+        with staged.open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, path)
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        logger.debug("Live transcript recovery projection failed (%s): %s", delegation_id, exc)
+        return False
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
 
 
 def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:
