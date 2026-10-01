@@ -75,6 +75,25 @@ def test_restart_reconciles_old_terminal_row_without_replaying_work(tmp_path, mo
                             ("deleg_aabbcc03",)).fetchone()[0] == "unknown"
 
 
+def test_grouped_unit_reconciles_shared_call_manifest_without_touching_sibling(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    call_id = "deleg_aabbcc05"
+    _, _, paths = create_live_transcripts([{"goal": "live sibling"}, {"goal": "dead child"}],
+                                          delegation_id=call_id)
+    manifest = live_transcript_root() / call_id / "manifest.json"
+    ad._persist_dispatch({
+        "delegation_id": call_id + "-2", "session_key": "session-owner",
+        "parent_session_id": "session-owner", "goal": "dead child",
+        "goals": ["dead child"], "is_batch": True, "task_indexes": [1],
+        "task_transcripts": {"1": paths[1]}, "status": "running",
+        "dispatched_at": time.time() - 100,
+    })
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert [task["status"] for task in _manifest(manifest)["tasks"]] == ["running", "unknown"]
+
+
 def test_live_owner_is_never_reclassified_by_reconciler(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = _dispatch("deleg_aabbcc04", ["long-running useful work"])

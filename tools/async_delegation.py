@@ -281,7 +281,20 @@ def _reconcile_terminal_live_manifests(rows) -> None:
                 i, outcome = entry.get("task_index"), entry.get("status")
                 if type(i) is int and i in statuses and isinstance(outcome, str) and outcome:
                     statuses[i] = outcome
-            reconcile_terminal_manifest(delegation_id, statuses)
+            manifest_id = delegation_id.split("-", 1)[0]
+            if manifest_id != delegation_id:
+                # Independent async units of one fan-out have suffixed ledger IDs
+                # but share the call's ONE live-transcript directory. Bind the
+                # target to the original transcript path, never merely strip a
+                # suffix from an untrusted row and write to the guessed parent.
+                from tools.delegation_live_log import live_transcript_root
+                refs = task.get("task_transcripts") or {}
+                if not isinstance(refs, dict) or not any(
+                    refs.get(str(i)) == str(live_transcript_root() / manifest_id / f"task-{i}.log")
+                    for i in statuses
+                ):
+                    continue
+            reconcile_terminal_manifest(manifest_id, statuses)
         except (TypeError, ValueError, AttributeError) as exc:
             logger.debug("Delegation %s: ignored malformed live-manifest projection: %s", delegation_id, exc)
 
