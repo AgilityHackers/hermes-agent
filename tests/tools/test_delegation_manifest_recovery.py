@@ -3,7 +3,7 @@ import json
 import time
 
 from tools import async_delegation as ad
-from tools.delegation_live_log import create_live_transcripts, live_transcript_root
+from tools.delegation_live_log import create_live_transcripts, live_transcript_root, update_manifest_statuses
 
 
 def _dispatch(delegation_id, goals):
@@ -92,6 +92,49 @@ def test_grouped_unit_reconciles_shared_call_manifest_without_touching_sibling(t
 
     assert ad.recover_abandoned_delegations() == 1
     assert [task["status"] for task in _manifest(manifest)["tasks"]] == ["running", "unknown"]
+    assert "completed" not in _manifest(manifest)  # sibling is still live
+
+
+def test_late_sidecar_writer_cannot_permanently_override_terminal_ledger(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = _dispatch("deleg_aabbcc06", ["review"])
+    ad._persist_completion({"delegation_id": "deleg_aabbcc06", "status": "unknown"},
+                           {"status": "unknown", "error": "owner died"})
+    ad.recover_abandoned_delegations()
+    assert _manifest(path)["tasks"][0]["status"] == "unknown"
+    # A late sidecar-only write must not become a permanent false result.
+    update_manifest_statuses("deleg_aabbcc06", [{"task_index": 0, "status": "completed"}])
+    assert _manifest(path)["tasks"][0]["status"] == "completed"
+    ad.recover_abandoned_delegations()
+    assert _manifest(path)["tasks"][0]["status"] == "unknown"
+
+
+def test_terminal_projection_survives_unavailable_liveness_probe(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = _dispatch("deleg_aabbcc07", ["settled before restart"])
+    ad._persist_completion({"delegation_id": "deleg_aabbcc07", "status": "unknown"},
+                           {"status": "unknown", "error": "owner died"})
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: None)
+    assert ad.recover_abandoned_delegations() == 0
+    assert _manifest(path)["tasks"][0]["status"] == "unknown"
+
+
+def test_normal_status_writer_never_exposes_partial_manifest_on_write_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = _dispatch("deleg_aabbcc08", ["review"])
+    original_write_text = type(path).write_text
+
+    def interrupted_direct_write(self, text, *args, **kwargs):
+        if self == path:
+            with self.open("w", encoding="utf-8") as stream:
+                stream.write("{")  # simulate interruption after truncating the live JSON
+            raise OSError("writer lost during a direct manifest write")
+        return original_write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "write_text", interrupted_direct_write)
+    update_manifest_statuses("deleg_aabbcc08", [{"task_index": 0, "status": "completed"}])
+    assert _manifest(path)["tasks"][0]["status"] == "completed"
+    assert not list(path.parent.glob(".manifest.*"))
 
 
 def test_live_owner_is_never_reclassified_by_reconciler(tmp_path, monkeypatch):

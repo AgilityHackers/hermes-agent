@@ -304,6 +304,14 @@ def recover_abandoned_delegations() -> int:
     recorded (``record_unit_child``) are replayed with their real results."""
     alive = _owner_liveness()
     if alive is None:
+        # A broken process probe must never authorize retirement of a running
+        # owner. Cache-only projection of rows already terminal is independent
+        # of that probe, however, and remains safe to do at startup/sweep.
+        with _DB_LOCK, _transaction() as conn:
+            terminal_rows = conn.execute("""SELECT delegation_id,state,result_json,task_json
+                   FROM async_delegations WHERE state NOT IN ('running','finalizing')
+                     AND dispatched_at > ?""", (time.time() - _DURABLE_RETENTION_SECONDS,)).fetchall()
+        _reconcile_terminal_live_manifests(terminal_rows)
         return 0
     now, recovered = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
