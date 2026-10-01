@@ -2,7 +2,10 @@
 import json
 import time
 
+import pytest
+
 from tools import async_delegation as ad
+from tools import delegation_live_log as dll
 from tools.delegation_live_log import create_live_transcripts, live_transcript_root, update_manifest_statuses
 
 
@@ -135,6 +138,37 @@ def test_normal_status_writer_never_exposes_partial_manifest_on_write_failure(tm
     update_manifest_statuses("deleg_aabbcc08", [{"task_index": 0, "status": "completed"}])
     assert _manifest(path)["tasks"][0]["status"] == "completed"
     assert not list(path.parent.glob(".manifest.*"))
+
+
+@pytest.mark.parametrize("writer", ["normal", "recovery"])
+@pytest.mark.parametrize("stage", ["dump", "fsync", "replace"])
+def test_failed_staged_write_preserves_live_json_and_cleans_staging(tmp_path, monkeypatch, writer, stage):
+    """Exercise the *actual* staged seam, not only the retired direct-write path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_aabbcc09"
+    path = _dispatch(delegation_id, ["read-only review"])
+    before = path.read_bytes()
+    failures = []
+
+    def fail_stage(*args, **kwargs):
+        failures.append(stage)
+        if stage == "dump":
+            args[1].write("{")  # a truncated staging file, never the live manifest
+        raise OSError("simulated loss during staged write")
+
+    if stage == "dump":
+        monkeypatch.setattr(dll.json, "dump", fail_stage)
+    else:
+        monkeypatch.setattr(dll.os, stage, fail_stage)
+    if writer == "normal":
+        update_manifest_statuses(delegation_id, [{"task_index": 0, "status": "completed"}])
+    else:
+        assert dll.reconcile_terminal_manifest(delegation_id, {0: "unknown"}) is False
+
+    assert failures == [stage], "the failure must reach the staged writer"
+    assert path.read_bytes() == before
+    assert _manifest(path)["tasks"][0]["status"] == "running"
+    assert not list(path.parent.glob(".manifest.staged.*"))
 
 
 def test_live_owner_is_never_reclassified_by_reconciler(tmp_path, monkeypatch):
