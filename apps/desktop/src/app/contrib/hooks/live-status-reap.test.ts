@@ -99,6 +99,61 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
     expect(part.result).toBeUndefined() // idle is not proof the tool succeeded
   })
 
+  it('ignores a stale pre-turn idle snapshot after a newer turn observed its first payload', () => {
+    // Poll issued while the backend was idle: stateAtRequest is the pre-turn
+    // snapshot. It races the submit below, so its `idle` answer is stale the
+    // moment it lands.
+    publishSessionState('runtime-race2', { ...createClientSessionState('stored-race2') })
+    const stateAtRequest = $sessionStates.get()
+
+    // The turn starts and its first payload arrives while the poll is in
+    // flight — sawAssistantPayload is already true, so localSubmitPending is
+    // false and ONLY the request-time reference guard protects it.
+    publishSessionState('runtime-race2', {
+      ...$sessionStates.get()['runtime-race2'],
+      busy: true,
+      awaitingResponse: true,
+      sawAssistantPayload: true,
+      turnLive: true,
+      streamId: 'reply-b'
+    })
+
+    // The old idle response finally arrives.
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: 'runtime-race2', session_key: 'stored-race2', status: 'idle' }] },
+      Date.now(),
+      'default',
+      stateAtRequest
+    )
+
+    expect($workingSessionIds.get()).toContain('stored-race2')
+    expect($sessionStates.get()['runtime-race2']).toMatchObject({
+      busy: true,
+      awaitingResponse: true,
+      sawAssistantPayload: true,
+      turnLive: true,
+      streamId: 'reply-b'
+    })
+    expect($unreadFinishedSessionIds.get()).not.toContain('stored-race2')
+
+    // Positive control: a CURRENT idle snapshot (request issued after the same
+    // live state) is not stale and must settle the turn.
+    rehydrateLiveSessionStatuses(
+      { sessions: [{ id: 'runtime-race2', session_key: 'stored-race2', status: 'idle' }] },
+      Date.now(),
+      'default',
+      $sessionStates.get()
+    )
+
+    expect($workingSessionIds.get()).not.toContain('stored-race2')
+    expect($sessionStates.get()['runtime-race2']).toMatchObject({
+      busy: false,
+      awaitingResponse: false,
+      turnLive: false,
+      streamId: null
+    })
+  })
+
   it('does not settle a just-submitted turn before its first payload', () => {
     publishSessionState('runtime-new', {
       ...createClientSessionState('stored-new'),
