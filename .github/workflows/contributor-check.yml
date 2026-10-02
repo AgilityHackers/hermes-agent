@@ -23,12 +23,15 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          CALLER_EVENT: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # Attribute only commits introduced by the PR against its ACTUAL base.
           # A fork's DEV release PR can target a pinned branch, not main. Scanning
           # origin/main here falsely attributes the entire upstream history.
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            BASE_SHA=$(jq -r '.pull_request.base.sha // empty' "$GITHUB_EVENT_PATH")
+          if [ "$CALLER_EVENT" = "pull_request" ]; then
+            BASE_SHA="$PR_BASE_SHA"
             if [ -z "$BASE_SHA" ] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
               echo "PR base SHA unavailable — refuse attribution check" >&2
               exit 1
