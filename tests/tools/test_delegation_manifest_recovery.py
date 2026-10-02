@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools import async_delegation as ad
 from tools import delegation_live_log as dll
 from tools.delegation_live_log import create_live_transcripts, live_transcript_root, update_manifest_statuses
@@ -181,3 +182,41 @@ def test_live_owner_is_never_reclassified_by_reconciler(tmp_path, monkeypatch):
     with ad._connect() as conn:
         assert conn.execute("select state from async_delegations where delegation_id=?",
                             ("deleg_aabbcc04",)).fetchone()[0] == "running"
+
+
+def test_manifest_recovery_isolated_across_profiles(tmp_path, monkeypatch):
+    """One profile's dead owner never retires a sibling's still-running child."""
+    default = tmp_path / "default"
+    sibling = tmp_path / "profiles" / "sibling"
+    default.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default))
+
+    def dispatch_at(home, delegation_id):
+        token = set_hermes_home_override(home)
+        try:
+            return _dispatch(delegation_id, ["read-only profile check"])
+        finally:
+            reset_hermes_home_override(token)
+
+    default_manifest = dispatch_at(default, "deleg_aabbcc21")
+    sibling_manifest = dispatch_at(sibling, "deleg_aabbcc22")
+    assert _manifest(default_manifest)["tasks"][0]["status"] == "running"
+    assert _manifest(sibling_manifest)["tasks"][0]["status"] == "running"
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+
+    token = set_hermes_home_override(default)
+    try:
+        assert ad.recover_abandoned_delegations() == 1
+    finally:
+        reset_hermes_home_override(token)
+    assert _manifest(default_manifest)["tasks"][0]["status"] == "unknown"
+    assert _manifest(sibling_manifest)["tasks"][0]["status"] == "running"
+
+    token = set_hermes_home_override(sibling)
+    try:
+        assert ad.recover_abandoned_delegations() == 1
+    finally:
+        reset_hermes_home_override(token)
+    assert _manifest(default_manifest)["tasks"][0]["status"] == "unknown"
+    assert _manifest(sibling_manifest)["tasks"][0]["status"] == "unknown"
