@@ -24,8 +24,19 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Attribute only commits introduced by the PR against its ACTUAL base.
+          # A fork's DEV release PR can target a pinned branch, not main. Scanning
+          # origin/main here falsely attributes the entire upstream history.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA=$(jq -r '.pull_request.base.sha // empty' "$GITHUB_EVENT_PATH")
+            if [ -z "$BASE_SHA" ] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+              echo "PR base SHA unavailable — refuse attribution check" >&2
+              exit 1
+            fi
+            MERGE_BASE=$(git merge-base "$BASE_SHA" HEAD)
+          else
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
