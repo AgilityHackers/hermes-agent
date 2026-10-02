@@ -181,3 +181,57 @@ def test_live_owner_is_never_reclassified_by_reconciler(tmp_path, monkeypatch):
     with ad._connect() as conn:
         assert conn.execute("select state from async_delegations where delegation_id=?",
                             ("deleg_aabbcc04",)).fetchone()[0] == "running"
+
+
+def test_suffixed_row_pointing_outside_parent_leaves_manifest_untouched(tmp_path, monkeypatch):
+    """A suffixed row may not strip to a guessed parent: its own ``task_transcripts`` must
+    name that parent's canonical file. Forged refs (another delegation's directory) write
+    nothing — both live manifests stay byte-identical (PR #130937 review finding)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent, other = "deleg_aabbcc10", "deleg_aabbcc11"
+    create_live_transcripts([{"goal": "live parent review"}], delegation_id=parent)
+    _, _, other_paths = create_live_transcripts([{"goal": "unrelated live review"}], delegation_id=other)
+    parent_manifest = live_transcript_root() / parent / "manifest.json"
+    other_manifest = live_transcript_root() / other / "manifest.json"
+    before_parent, before_other = parent_manifest.read_bytes(), other_manifest.read_bytes()
+    # A real suffixed id: this unit row's transcripts name the OTHER delegation's file, so
+    # stripping "-1" and writing to the guessed parent would corrupt a manifest it never owned.
+    ad._persist_dispatch({
+        "delegation_id": "deleg_aabbcc10-1", "session_key": "session-owner",
+        "parent_session_id": "session-owner", "goal": "forged unit", "goals": ["forged unit"],
+        "is_batch": True, "task_indexes": [0], "task_transcripts": {"0": other_paths[0]},
+        "status": "running", "dispatched_at": time.time() - 100,
+    })
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+
+    assert ad.recover_abandoned_delegations() == 1  # the abandoned row itself still settles
+    assert _manifest(parent_manifest)["tasks"][0]["status"] == "running"  # refusal: no write
+    assert parent_manifest.read_bytes() == before_parent  # byte-identical: no partial write
+    assert other_manifest.read_bytes() == before_other
+    assert not list(parent_manifest.parent.glob(".manifest.*"))  # no staging residue
+    assert not list(other_manifest.parent.glob(".manifest.*"))
+    assert ad.recover_abandoned_delegations() == 0  # repeated sweeps keep refusing
+    assert parent_manifest.read_bytes() == before_parent
+
+
+def test_suffixed_row_pointing_inside_parent_still_applies_status(tmp_path, monkeypatch):
+    """The binding check discriminates rather than blanket-skipping suffixed rows: a row
+    whose own ``task_transcripts`` name the parent's canonical file still projects its
+    terminal status there (PR #130937 review finding)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = "deleg_aabbcc12"
+    _, _, paths = create_live_transcripts([{"goal": "settled unit"}], delegation_id=parent)
+    manifest = live_transcript_root() / parent / "manifest.json"
+    ad._persist_dispatch({
+        "delegation_id": "deleg_aabbcc12-1", "session_key": "session-owner",
+        "parent_session_id": "session-owner", "goal": "settled unit", "goals": ["settled unit"],
+        "is_batch": True, "task_indexes": [0], "task_transcripts": {"0": paths[0]},
+        "status": "running", "dispatched_at": time.time() - 100,
+    })
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert _manifest(manifest)["tasks"][0]["status"] == "unknown"  # bound row applies
+    once = manifest.read_bytes()
+    assert ad.recover_abandoned_delegations() == 0
+    assert manifest.read_bytes() == once
