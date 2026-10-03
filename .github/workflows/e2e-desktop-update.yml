@@ -50,6 +50,18 @@ jobs:
           # The seeded install clones this checkout through a local bare origin.
           fetch-depth: 0
 
+      - name: Free disk space
+        # The private standard class carries a small system volume; the seeded
+        # install clone hit ENOSPC at ~10 min (2026-10-03). Reclaim
+        # preinstalled toolchains this suite never uses.
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup /opt/microsoft
+          df -h /
+
       - name: Install system dependencies for Electron and the sandbox
         run: |
           sudo apt-get update -qq

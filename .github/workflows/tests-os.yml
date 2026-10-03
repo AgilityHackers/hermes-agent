@@ -78,10 +78,11 @@ jobs:
           - name: Windows-only tests
             runner: windows-latest
             marker: windows
+            timeout: 60
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
             marker: windows
-            timeout: 60
+            timeout: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -172,9 +173,11 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. CPU-count parallelism
-          # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          # These files spawn nested PowerShell trees. 16 workers was tuned
+          # for the 32-core class; the private standard class starves there
+          # (300 s SIGKILL storms, 2026-10-03) — four keeps cold child
+          # startup inside the fixture's idle deadline.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
@@ -205,10 +208,9 @@ jobs:
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
     if: inputs.e2e
-    # This fork route uses a private standard Windows runner. Historical
-    # measurements: on a 4-vCPU image the suite step took 153-171 s (job
-    # 4.7-5.6 min); on a 32-core runner it took 124 s (job 3.1 min).
-    # Neither measurement proves the smaller private runner will finish.
+    # History: on the prior 4-vCPU image the suite step took 153-171 s (job
+    # 4.7-5.6 min); on a 32-core runner 124 s (job 3.1 min). It passed on the
+    # private standard class on 2026-10-03 (18.5 min job).
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
