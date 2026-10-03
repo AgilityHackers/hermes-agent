@@ -28,7 +28,7 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -108,10 +108,11 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
-    # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # Fork-only runner-route probe: the private standard runner has fewer
+    # cores than the prior large runner. Keep the same test set and failure
+    # semantics; resource/time adequacy must be proven by this run.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -231,7 +232,7 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
