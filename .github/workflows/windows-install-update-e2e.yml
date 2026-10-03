@@ -30,8 +30,13 @@ jobs:
     runs-on: windows-latest
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
     # Private standard class, 2026-10-03: six parallel installs starved the
-    # 1500 s install premise; three workers plus this budget carry the journey.
-    timeout-minutes: 75
+    # journey; three workers plus the budgets below carry it.
+    # Standard-class budget: the journey provisions a full dependency
+    # environment; on the private standard runners the npm phase exceeded the
+    # install premise on every machine in both cycles (windows-install-update
+    # artifacts, 2026-10-03). Install premise 3600 s; two waves of six journeys
+    # fit 240 min. Steps unchanged.
+    timeout-minutes: 240
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -65,7 +70,9 @@ jobs:
           # One journey per file; three at a time on the private standard class
           # (six parallel installs starved the 1500 s install premise, 2026-10-03).
           HERMES_TEST_WORKERS: '3'
-          HERMES_TEST_FILE_TIMEOUT: '2400'
+          # Install premise 3600 s + update phases + turns must fit; budget the
+          # file above their sum for the slowest standard machines.
+          HERMES_TEST_FILE_TIMEOUT: '5400'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
