@@ -261,6 +261,19 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Restore upstream release tags so N-1 resolves to a current release
+        # The upgrade suites resolve N-1 as the newest v20YY.* tag reachable
+        # from HEAD~1 against THIS checkout's tag refs. This fork's own tag
+        # mirror stops at v2026.6.19 — a release that predates the gateway
+        # control socket (first released v2026.8.27) and
+        # hermes_cli.config_defaults (added 2026-07-29), so the N-1 premise
+        # could never hold (2026-10-03). Mirror upstream's release tags before
+        # the suite runs; test files and assertions are unchanged.
+        run: |
+          set -euo pipefail
+          git fetch --no-recurse-submodules \
+            https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
+
       - name: Free disk space
         # The private standard class carries a small system volume; the N-1
         # seed installs plus uv/npm caches exhausted it (ENOSPC across five
