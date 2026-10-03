@@ -13,10 +13,11 @@ jobs:
     # restores.
     #
     # One runner installs once; vitest, tsc and eslint each size their own
-    # worker pool from the available core count. Fork standard-runner resource
-    # adequacy is unproven until the exact-head job finishes.
+    # worker pool from the available core count. Measured 2026-10-03 on the
+    # private standard class: 9/10 checks in ~28 min, all green — the budget
+    # below carries the full set.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - name: Set up the locked JS build toolchain

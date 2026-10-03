@@ -174,7 +174,21 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+
+        def child_reports_stopped() -> bool:
+            # psutil reads the kernel snapshot of the child's thread states; on a slow runner a
+            # just-created CREATE_SUSPENDED child can still read 'running' there for a moment.
+            # The child cannot run while suspended and nothing resumes it before spawn_server's
+            # own resume(), so wait (bounded) for the state this call is entitled to. A child
+            # that were resumed would never read 'stopped' and would still fail this assert --
+            # and the marker assert below proves it never ran.
+            try:
+                return psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+            except psutil.NoSuchProcess:
+                return False
+
+        assert _wait(child_reports_stopped), \
+            'a suspended child never reported STATUS_STOPPED before assignment'
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()

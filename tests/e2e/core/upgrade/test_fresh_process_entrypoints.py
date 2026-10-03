@@ -507,7 +507,12 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
     env = isolated_env(tmp_path / "sbx")
-    cp = run([PY, str(runner), str(spec_path)], env=env, cwd=tmp_path, writable=[tmp_path], timeout=900)
+    # Bounded for the standard class: the runner imports every shipped module
+    # with 2-8 forked workers; on a 2-core standard runner that exceeds 15 min
+    # (timed out at 900 s in both cycles, 2026-10-03) while the enumeration
+    # and per-module checks are unchanged. The shard's per-file cap (3000 s)
+    # still bounds this file.
+    cp = run([PY, str(runner), str(spec_path)], env=env, cwd=tmp_path, writable=[tmp_path], timeout=2400)
     assert cp.returncode == 0 and out.exists(), describe(cp)
     results = {r["id"]: r for r in json.loads(out.read_text(encoding="utf-8"))}
     assert set(results) == set(ids), f"runner lost modules: {sorted(set(ids) - set(results))[:10]}"

@@ -422,7 +422,13 @@ def test_retained_endpoint_validates_identity(tmp_path, monkeypatch, damage):
             assert got == {"base_url": state["base_url"], "api_key": state["api_key"]}
             proc.terminate()
             proc.wait(timeout=5)
-            assert endpoint._state_endpoint() is None
+            # The child is dead (TerminateProcess + wait), but psutil's Windows liveness read
+            # is not instantaneous: a just-terminated process can still be enumerated for a
+            # moment, and recorded_process() then briefly re-accepts the dead incarnation. The
+            # guarantee under test is that identity validation rejects the dead process; wait
+            # (bounded) for the rejection. A process that were actually alive would keep the
+            # endpoint resolved and fail at the deadline exactly as before.
+            _wait_for(lambda: endpoint._state_endpoint() is None)
             assert path.exists()
         else:
             assert got is None

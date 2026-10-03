@@ -20,7 +20,11 @@ def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     return out
 
 
-def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
+def _read_json_line(out: queue.Queue[dict], timeout: float = 15.0) -> dict:
+    # Bounded, deliberately loose: the compute host is a fresh interpreter
+    # spawned by this test; interpreter start + imports can exceed 2 s on a
+    # cold standard CI runner. The protocol contract it proves (one JSON line
+    # per frame, exact shapes) is unchanged.
     try:
         return out.get(timeout=timeout)
     except queue.Empty as exc:

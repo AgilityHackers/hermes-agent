@@ -67,7 +67,13 @@ from tests.fakes.fake_llm_provider import write_hermes_home
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 OPT_IN_ENV = "HERMES_E2E_WINDOWS_INSTALL"
-INSTALL_TIMEOUT = 1500.0
+# Standard-class budget: the journey provisions a full dependency environment
+# (uv + python + ffmpeg/node/npm/agent-browser downloads + npm ci for the
+# ui-tui/web workspaces). On the private standard runners npm ci alone was
+# still running when this premise killed every machine's install — 683 s of
+# npm ci elapsed, unfinished; all 7 machines, both cycles (2026-10-03).
+# Budget the class; the assertions are unchanged.
+INSTALL_TIMEOUT = 3600.0
 UPDATE_TIMEOUT = 1200.0
 CMD_TIMEOUT = 300.0
 GATEWAY_READY_TIMEOUT = 240.0
