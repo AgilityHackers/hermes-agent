@@ -46,7 +46,11 @@ def _run_cwd_self_test(
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=60,
+        # Bounded, with class headroom: this PowerShell self-test normally
+        # completes in seconds, but a shared standard runner ran it past the
+        # old 60 s bound once under load (2026-10-03). A real hang still fails
+        # at the deadline.
+        timeout=240,
         check=False,
     )
 
@@ -87,7 +91,7 @@ def test_handoff_children_cannot_read_the_handoff_console(tmp_path: Path) -> Non
         [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
         env=env,
         creationflags=subprocess.CREATE_NEW_CONSOLE,
-        timeout=60,
+        timeout=240,
         check=False,
     )
 
