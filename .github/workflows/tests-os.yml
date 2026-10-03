@@ -178,6 +178,11 @@ jobs:
           # (300 s SIGKILL storms, 2026-10-03) — four keeps cold child
           # startup inside the fixture's idle deadline.
           HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          # The windows lanes carry heavy per-file suites (installer stages,
+          # PM build deps). The runner's 300 s default SIGKILL'd
+          # test_windows_build_deps once under load (2026-10-03); 900 matches
+          # the other windows lane. Non-windows rows get '' (not forwarded).
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.marker == 'windows' && '900' || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
