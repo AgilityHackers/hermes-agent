@@ -529,6 +529,13 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
+    # HERMES_TEST_SLICE partitions THIS invocation's discovery; it must not
+    # leak into the per-file pytest children. A test that spawns the runner
+    # itself (tests/scripts/test_run_tests_parallel.py, the run_tests.sh
+    # canary) would otherwise re-partition its own explicit file list — an
+    # explicit list or mini-fixture is smaller than 4 slices, so slice 4/4
+    # ran nothing and the child runner reported "0 files" (2026-10-03).
+    env.pop("HERMES_TEST_SLICE", None)
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
